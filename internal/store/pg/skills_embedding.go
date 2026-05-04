@@ -4,8 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-
-	"github.com/google/uuid"
+	"strings"
 
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
@@ -22,32 +21,56 @@ func (s *PGSkillStore) SearchByEmbedding(ctx context.Context, embedding []float3
 	}
 	vecStr := vectorToString(embedding)
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, slug, COALESCE(description, ''), version,
-				1 - (embedding <=> $1::vector) AS score
-			FROM skills
-			WHERE status = 'active' AND enabled = true AND embedding IS NOT NULL
-			  AND visibility != 'private'
-			ORDER BY embedding <=> $2::vector
-			LIMIT $3`,
-		vecStr, vecStr, limit,
-	)
+	// $1=vec, scope starts at $2 (if present), ORDER vec uses next available param, LIMIT after.
+	tc, tcArgs, nextParam, err := scopeClause(ctx, 2)
 	if err != nil {
+		return nil, err
+	}
+	tenantCond := buildSkillEmbeddingTenantCond(tc)
+	orderN := nextParam
+	limitN := orderN + 1
+	q := fmt.Sprintf(`SELECT name, slug, COALESCE(description, '') AS description, version, file_path,
+			1 - (embedding <=> $1::vector) AS score
+		FROM skills
+		WHERE status = 'active' AND enabled = true AND embedding IS NOT NULL
+		  AND visibility != 'private'%s
+		ORDER BY embedding <=> $%d::vector
+		LIMIT $%d`, tenantCond, orderN, limitN)
+
+	args := append([]any{vecStr}, tcArgs...)
+	args = append(args, vecStr, limit)
+
+	var scanned []skillEmbeddingSearchRow
+	if err := pkgSqlxDB.SelectContext(ctx, &scanned, q, args...); err != nil {
 		return nil, fmt.Errorf("embedding skill search: %w", err)
 	}
-	defer rows.Close()
 
-	var results []store.SkillSearchResult
-	for rows.Next() {
-		var r store.SkillSearchResult
-		var version int
-		if err := rows.Scan(&r.Name, &r.Slug, &r.Description, &version, &r.Score); err != nil {
-			continue
+	results := make([]store.SkillSearchResult, 0, len(scanned))
+	for _, row := range scanned {
+		r := store.SkillSearchResult{
+			Name:        row.Name,
+			Slug:        row.Slug,
+			Description: row.Desc,
+			Score:       row.Score,
 		}
-		r.Path = fmt.Sprintf("%s/%s/%d/SKILL.md", s.baseDir, r.Slug, version)
+		// Use DB file_path when available; fall back to baseDir construction.
+		if row.FilePath != nil && *row.FilePath != "" {
+			r.Path = *row.FilePath + "/SKILL.md"
+		} else {
+			r.Path = fmt.Sprintf("%s/%s/%d/SKILL.md", s.baseDir, row.Slug, row.Version)
+		}
 		results = append(results, r)
 	}
 	return results, nil
+}
+
+
+func buildSkillEmbeddingTenantCond(scope string) string {
+	if scope == "" {
+		return ""
+	}
+	tenantExpr := strings.TrimPrefix(scope, " AND ")
+	return fmt.Sprintf(" AND (is_system = true OR (%s))", tenantExpr)
 }
 
 // BackfillSkillEmbeddings generates embeddings for all active skills that don't have one yet.
@@ -56,25 +79,11 @@ func (s *PGSkillStore) BackfillSkillEmbeddings(ctx context.Context) (int, error)
 		return 0, nil
 	}
 
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, COALESCE(description, '') FROM skills WHERE status = 'active' AND enabled = true AND embedding IS NULL`)
-	if err != nil {
+	var pending []skillBackfillRow
+	if err := pkgSqlxDB.SelectContext(ctx, &pending,
+		`SELECT id, name, COALESCE(description, '') AS description FROM skills WHERE status = 'active' AND enabled = true AND embedding IS NULL`,
+	); err != nil {
 		return 0, err
-	}
-	defer rows.Close()
-
-	type skillRow struct {
-		id   uuid.UUID
-		name string
-		desc string
-	}
-	var pending []skillRow
-	for rows.Next() {
-		var r skillRow
-		if err := rows.Scan(&r.id, &r.name, &r.desc); err != nil {
-			continue
-		}
-		pending = append(pending, r)
 	}
 
 	if len(pending) == 0 {
@@ -84,13 +93,13 @@ func (s *PGSkillStore) BackfillSkillEmbeddings(ctx context.Context) (int, error)
 	slog.Info("backfilling skill embeddings", "count", len(pending))
 	updated := 0
 	for _, sk := range pending {
-		text := sk.name
-		if sk.desc != "" {
-			text += ": " + sk.desc
+		text := sk.Name
+		if sk.Desc != "" {
+			text += ": " + sk.Desc
 		}
 		embeddings, err := s.embProvider.Embed(ctx, []string{text})
 		if err != nil {
-			slog.Warn("skill embedding failed", "skill", sk.name, "error", err)
+			slog.Warn("skill embedding failed", "skill", sk.Name, "error", err)
 			continue
 		}
 		if len(embeddings) == 0 || len(embeddings[0]) == 0 {
@@ -98,9 +107,9 @@ func (s *PGSkillStore) BackfillSkillEmbeddings(ctx context.Context) (int, error)
 		}
 		vecStr := vectorToString(embeddings[0])
 		_, err = s.db.ExecContext(ctx,
-			`UPDATE skills SET embedding = $1::vector WHERE id = $2`, vecStr, sk.id)
+			`UPDATE skills SET embedding = $1::vector WHERE id = $2`, vecStr, sk.ID)
 		if err != nil {
-			slog.Warn("skill embedding update failed", "skill", sk.name, "error", err)
+			slog.Warn("skill embedding update failed", "skill", sk.Name, "error", err)
 			continue
 		}
 		updated++

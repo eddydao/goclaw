@@ -20,6 +20,9 @@ import (
 	"log/slog"
 	"regexp"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
 // SanitizeAssistantContent applies the full sanitization pipeline to assistant
@@ -166,21 +169,23 @@ func stripDowngradedToolCallText(content string) string {
 // --- 3. Thinking/reasoning tags ---
 
 // Matches TS stripThinkingTagsFromText() with strict mode.
-// Strips: <think>...</think>, <thinking>...</thinking>, <thought>...</thought>,
+// Strips: <redacted_thinking>...</redacted_thinking>, <think>...</think>,
+//         <thinking>...</thinking>, <thought>...</thought>,
 //         <antThinking>...</antThinking>
 // Go regexp doesn't support backreferences, so we use separate patterns.
 var thinkingTagPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`(?is)<think>.*?</think>`),
-	regexp.MustCompile(`(?is)<thinking>.*?</thinking>`),
-	regexp.MustCompile(`(?is)<thought>.*?</thought>`),
-	regexp.MustCompile(`(?is)<antThinking>.*?</antThinking>`),
-	regexp.MustCompile(`(?is)<antthinking>.*?</antthinking>`),
+	regexp.MustCompile(`(?is)<redacted_thinking\b[^>]*>.*?</redacted_thinking\s*>`),
+	regexp.MustCompile(`(?is)<thinking\b[^>]*>.*?</thinking\s*>`),
+	regexp.MustCompile(`(?is)<think\b[^>]*>.*?</think\s*>`),
+	regexp.MustCompile(`(?is)<thought\b[^>]*>.*?</thought\s*>`),
+	regexp.MustCompile(`(?is)<antThinking\b[^>]*>.*?</antThinking\s*>`),
+	regexp.MustCompile(`(?is)<antthinking\b[^>]*>.*?</antthinking\s*>`),
 }
 
 func stripThinkingTags(content string) string {
 	lower := strings.ToLower(content)
 	if !strings.Contains(lower, "<think") && !strings.Contains(lower, "<thought") &&
-		!strings.Contains(lower, "<antthinking") {
+		!strings.Contains(lower, "<antthinking") && !strings.Contains(lower, "<redacted_thinking") {
 		return content
 	}
 	result := content
@@ -346,7 +351,7 @@ func stripMarkdownCode(s string) string {
 // Mentions inside markdown code blocks and inline code are excluded from counting,
 // as they typically appear in architecture explanations rather than actual leaks.
 func StripConfigLeak(content, agentType string) string {
-	if agentType != "predefined" || content == "" {
+	if agentType != store.AgentTypePredefined || content == "" {
 		return content
 	}
 
@@ -373,35 +378,65 @@ func StripConfigLeak(content, agentType string) string {
 
 // --- NO_REPLY detection ---
 
-// IsSilentReply checks if the text is a NO_REPLY token.
-// Matching TS isSilentReplyText() from auto-reply/tokens.ts.
+// IsSilentReply checks if the text begins with a NO_REPLY token.
+//
+// Divergent from TS isSilentReplyText() (exact-match only) — we match broadly:
+// decorative wrappers (`NO_REPLY_`, `"NO_REPLY"`, `**NO_REPLY**`) AND trailing
+// explanations (`NO_REPLY because offline`, `NO_REPLY: note`) suppress delivery.
+// Only requirement: the token is not glued to another word (`NO_REPLYING` is NOT silent).
+// Case-insensitive.
+//
+// Trade-off vs upstream #19537: upstream guards against suppressing substantive
+// replies that end in NO_REPLY. We accept that risk because observed model output
+// leans toward "NO_REPLY + reason" rather than "real reply ending in NO_REPLY".
 func IsSilentReply(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
 		return false
 	}
+	// Strip decorative wrappers from both ends (quotes, markdown emphasis, punctuation).
+	stripped := strings.Trim(trimmed, "_ \t\n\r.,:;!?\"'`*~#>-()[]{}")
 	const token = "NO_REPLY"
-	// Exact match
-	if trimmed == token {
+	if len(stripped) < len(token) {
+		return false
+	}
+	if !strings.EqualFold(stripped[:len(token)], token) {
+		return false
+	}
+	if len(stripped) == len(token) {
 		return true
 	}
-	// Starts with token followed by non-word char or end
-	if strings.HasPrefix(trimmed, token) {
-		rest := trimmed[len(token):]
-		if rest == "" || !isWordChar(rune(rest[0])) {
-			return true
-		}
-	}
-	// Ends with token preceded by non-word char
-	if strings.HasSuffix(trimmed, token) {
-		before := trimmed[:len(trimmed)-len(token)]
-		if before == "" || !isWordChar(rune(before[len(before)-1])) {
-			return true
-		}
-	}
-	return false
+	// Token must not be glued to another word — next rune must be non-alphanumeric.
+	next, _ := utf8.DecodeRuneInString(stripped[len(token):])
+	return !isAlphaNum(next)
+}
+
+func isAlphaNum(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
 func isWordChar(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_'
+}
+
+// --- Message Directives ([[name:value]]) ---
+
+// messageDirectivePattern matches structured routing tags: [[word]] or [[word:value]].
+// Single-line only (no (?s) dotall). Does NOT match arbitrary [[...]] content.
+var messageDirectivePattern = regexp.MustCompile(`\[\[\w+(?::[^\]\n]+)?\]\]`)
+
+// StripMessageDirectives removes internal [[...]] routing tags from user-facing text,
+// preserving [[tts...]] tags needed by the TTS auto-apply pipeline.
+func StripMessageDirectives(content string) string {
+	if !strings.Contains(content, "[[") {
+		return content
+	}
+	result := messageDirectivePattern.ReplaceAllStringFunc(content, func(match string) string {
+		inner := match[2 : len(match)-2] // strip [[ and ]]
+		if strings.HasPrefix(inner, "tts") {
+			return match // preserve for TTS AutoTagged mode
+		}
+		return ""
+	})
+	return strings.TrimSpace(result)
 }

@@ -1,8 +1,9 @@
 package pg
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,8 +11,8 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
 
-func (s *PGCronStore) RunJob(jobID string, force bool) (bool, string, error) {
-	job, ok := s.GetJob(jobID)
+func (s *PGCronStore) RunJob(ctx context.Context, jobID string, force bool) (bool, string, error) {
+	job, ok := s.GetJob(ctx, jobID)
 	if !ok {
 		return false, "", fmt.Errorf("job %s not found", jobID)
 	}
@@ -24,25 +25,38 @@ func (s *PGCronStore) RunJob(jobID string, force bool) (bool, string, error) {
 		return false, "", fmt.Errorf("no job handler configured")
 	}
 
-	// Mark job as running before execution
-	if id, parseErr := uuid.Parse(jobID); parseErr == nil {
-		s.db.Exec("UPDATE cron_jobs SET last_status = 'running', updated_at = $1 WHERE id = $2", time.Now(), id)
+	// Claim the job for forced execution by clearing next_run_at.
+	// executeOneJob calls loadClaimedJob which requires next_run_at IS NULL — same
+	// invariant that claimDueJob establishes for scheduled runs.
+	id, parseErr := uuid.Parse(jobID)
+	if parseErr != nil {
+		return false, "", fmt.Errorf("invalid job id %q: %w", jobID, parseErr)
+	}
+	res, err := s.db.ExecContext(ctx, "UPDATE cron_jobs SET last_status = 'running', next_run_at = NULL, updated_at = $1 WHERE id = $2 AND last_status IS DISTINCT FROM 'running'", time.Now(), id)
+	if err != nil {
+		slog.Warn("cron: failed to claim job for forced run", "jobId", jobID, "error", err)
+		return false, "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return false, "", fmt.Errorf("job %s is already running", jobID)
 	}
 	s.mu.Lock()
 	s.cacheLoaded = false
 	s.mu.Unlock()
 
-	s.emitEvent(store.CronEvent{Action: "running", JobID: job.ID, JobName: job.Name})
+	s.emitEvent(store.CronEvent{Action: "running", JobID: job.ID, JobName: job.Name, UserID: job.UserID})
 
-	// Use executeOneJob for proper state updates, run logging, and retry
-	s.executeOneJob(*job, handler)
+	// Run directly without reload — job already loaded and claimed above.
+	// reloadClaimed=false skips loadClaimedJob (which requires enabled=true),
+	// allowing manual runs on disabled jobs.
+	s.executeOneJob(*job, handler, false)
 	s.mu.Lock()
 	s.cacheLoaded = false
 	s.mu.Unlock()
 	return true, "", nil
 }
 
-func (s *PGCronStore) GetRunLog(jobID string, limit, offset int) ([]store.CronRunLogEntry, int) {
+func (s *PGCronStore) GetRunLog(ctx context.Context, jobID string, limit, offset int) ([]store.CronRunLogEntry, int) {
 	if limit <= 0 {
 		limit = 20
 	}
@@ -50,51 +64,57 @@ func (s *PGCronStore) GetRunLog(jobID string, limit, offset int) ([]store.CronRu
 		offset = 0
 	}
 
-	const cols = "job_id, status, error, summary, ran_at, COALESCE(duration_ms, 0), COALESCE(input_tokens, 0), COALESCE(output_tokens, 0)"
+	// Aliased cols so sqlx StructScan maps to cronRunLogRow db tags.
+	const cols = "r.job_id, r.status, r.error, r.summary, r.ran_at," +
+		" COALESCE(r.duration_ms, 0) AS duration_ms," +
+		" COALESCE(r.input_tokens, 0) AS input_tokens," +
+		" COALESCE(r.output_tokens, 0) AS output_tokens"
+
+	// Build tenant-aware WHERE clause via JOIN with cron_jobs.
+	var tenantJoin, tenantWhere string
+	var tenantArgs []any
+	if !store.IsCrossTenant(ctx) {
+		tid := store.TenantIDFromContext(ctx)
+		if tid != uuid.Nil {
+			tenantJoin = " JOIN cron_jobs j ON r.job_id = j.id"
+			tenantWhere = " AND j.tenant_id = $1"
+			tenantArgs = append(tenantArgs, tid)
+		}
+	}
 
 	var total int
-	var rows *sql.Rows
-	var err error
+	var dataQ string
+	var dataArgs []any
+
 	if jobID != "" {
 		id, parseErr := uuid.Parse(jobID)
 		if parseErr != nil {
 			return nil, 0
 		}
-		s.db.QueryRow("SELECT COUNT(*) FROM cron_run_logs WHERE job_id = $1", id).Scan(&total)
-		rows, err = s.db.Query(
-			"SELECT "+cols+" FROM cron_run_logs WHERE job_id = $1 ORDER BY ran_at DESC LIMIT $2 OFFSET $3",
-			id, limit, offset)
-	} else {
-		s.db.QueryRow("SELECT COUNT(*) FROM cron_run_logs").Scan(&total)
-		rows, err = s.db.Query(
-			"SELECT "+cols+" FROM cron_run_logs ORDER BY ran_at DESC LIMIT $1 OFFSET $2", limit, offset)
-	}
-	if err != nil {
-		return nil, 0
-	}
-	defer rows.Close()
+		argIdx := len(tenantArgs) + 1
+		countQ := fmt.Sprintf("SELECT COUNT(*) FROM cron_run_logs r%s WHERE r.job_id = $%d%s", tenantJoin, argIdx, tenantWhere)
+		s.db.QueryRowContext(ctx, countQ, append(tenantArgs, id)...).Scan(&total) //nolint:errcheck
 
-	var result []store.CronRunLogEntry
-	for rows.Next() {
-		var jobUUID uuid.UUID
-		var status string
-		var errStr, summary *string
-		var ranAt time.Time
-		var durationMS int64
-		var inputTokens, outputTokens int
-		if err := rows.Scan(&jobUUID, &status, &errStr, &summary, &ranAt, &durationMS, &inputTokens, &outputTokens); err != nil {
-			continue
-		}
-		result = append(result, store.CronRunLogEntry{
-			Ts:           ranAt.UnixMilli(),
-			JobID:        jobUUID.String(),
-			Status:       status,
-			Error:        derefStr(errStr),
-			Summary:      derefStr(summary),
-			DurationMS:   durationMS,
-			InputTokens:  inputTokens,
-			OutputTokens: outputTokens,
-		})
+		dataQ = fmt.Sprintf("SELECT %s FROM cron_run_logs r%s WHERE r.job_id = $%d%s ORDER BY r.ran_at DESC LIMIT $%d OFFSET $%d",
+			cols, tenantJoin, argIdx, tenantWhere, argIdx+1, argIdx+2)
+		dataArgs = append(tenantArgs, id, limit, offset)
+	} else {
+		argIdx := len(tenantArgs) + 1
+		countQ := fmt.Sprintf("SELECT COUNT(*) FROM cron_run_logs r%s WHERE 1=1%s", tenantJoin, tenantWhere)
+		s.db.QueryRowContext(ctx, countQ, tenantArgs...).Scan(&total) //nolint:errcheck
+
+		dataQ = fmt.Sprintf("SELECT %s FROM cron_run_logs r%s WHERE 1=1%s ORDER BY r.ran_at DESC LIMIT $%d OFFSET $%d",
+			cols, tenantJoin, tenantWhere, argIdx, argIdx+1)
+		dataArgs = append(tenantArgs, limit, offset)
+	}
+
+	var scanned []cronRunLogRow
+	if err := pkgSqlxDB.SelectContext(ctx, &scanned, dataQ, dataArgs...); err != nil {
+		return nil, total
+	}
+	result := make([]store.CronRunLogEntry, 0, len(scanned))
+	for i := range scanned {
+		result = append(result, scanned[i].toCronRunLogEntry())
 	}
 	return result, total
 }

@@ -1,6 +1,7 @@
 package skills
 
 import (
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -8,12 +9,17 @@ import (
 )
 
 // SkillManifest holds dependency info for a skill.
-// Populated by ScanSkillDeps via static analysis of scripts/ directory.
+// Populated by ScanSkillDeps via static analysis of scripts/ directory,
+// optionally overridden/filtered by SKILL.md frontmatter (deps: / exclude_deps:).
 type SkillManifest struct {
 	Requires       []string `json:"requires,omitempty"`        // system binaries (python3, pandoc, ffmpeg)
 	RequiresPython []string `json:"requires_python,omitempty"` // raw Python import names (e.g. "openpyxl", "cv2")
 	RequiresNode   []string `json:"requires_node,omitempty"`   // npm package names (e.g. "docx", "pptxgenjs")
 	ScriptsDir     string   `json:"-"`                         // absolute path to scripts/ dir, used for PYTHONPATH
+	// Manifest-origin fields — populated when SKILL.md declares deps:/exclude_deps:.
+	Explicit     []string `json:"explicit,omitempty"`      // raw dep strings from SKILL.md deps: (e.g. "pip:psycopg2-binary")
+	ExcludeDeps  []string `json:"exclude_deps,omitempty"`  // filter list from SKILL.md exclude_deps:
+	FromManifest bool     `json:"from_manifest,omitempty"` // true when Explicit was the authoritative source
 }
 
 // IsEmpty returns true if the manifest has no dependencies.
@@ -21,9 +27,26 @@ func (m *SkillManifest) IsEmpty() bool {
 	return len(m.Requires) == 0 && len(m.RequiresPython) == 0 && len(m.RequiresNode) == 0
 }
 
-// ScanSkillDeps auto-detects dependencies by statically analyzing the scripts/ directory.
+// ScanSkillDeps auto-detects dependencies by statically analyzing the scripts/ directory,
+// then applies any SKILL.md frontmatter overrides (deps: / exclude_deps:).
 func ScanSkillDeps(skillDir string) *SkillManifest {
-	return scanScriptsDir(filepath.Join(skillDir, "scripts"))
+	scan := scanScriptsDir(filepath.Join(skillDir, "scripts"))
+	deps, excludeDeps := parseSkillManifestFile(skillMdPath(skillDir))
+	if len(deps) == 0 && len(excludeDeps) == 0 {
+		return scan
+	}
+	merged := applyManifestOverride(scan, deps, excludeDeps)
+	if merged.FromManifest {
+		slog.Debug("dep_scanner: manifest override applied",
+			"dir", skillDir,
+			"explicit_count", len(deps),
+			"scan_py", len(scan.RequiresPython),
+			"scan_node", len(scan.RequiresNode))
+	} else if len(excludeDeps) > 0 {
+		slog.Debug("dep_scanner: manifest exclude applied",
+			"dir", skillDir, "exclude_count", len(excludeDeps))
+	}
+	return merged
 }
 
 // scanScriptsDir statically analyzes script files to detect dependencies.
@@ -34,6 +57,7 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 
 	entries, err := os.ReadDir(scriptsDir)
 	if err != nil {
+		slog.Debug("dep_scanner: scripts dir not found", "dir", scriptsDir, "error", err)
 		return m
 	}
 
@@ -42,6 +66,8 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 	binaries := make(map[string]bool)
 	// Track subdirectory names — these are local modules and must never be reported as missing.
 	localModules := make(map[string]bool)
+	// The scripts directory itself can be referenced as a module (e.g. "from scripts import utils").
+	localModules[filepath.Base(scriptsDir)] = true
 
 	for _, e := range entries {
 		if e.IsDir() {
@@ -53,11 +79,29 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 			}
 			for _, se := range subEntries {
 				if se.IsDir() {
+					// Track nested subdirs as local modules too (e.g. office/helpers, office/validators)
+					// so intra-package imports like "from helpers import ..." don't get falsely reported.
+					localModules[se.Name()] = true
+					// Scan files inside nested subdirs
+					nestedEntries, err := os.ReadDir(filepath.Join(scriptsDir, e.Name(), se.Name()))
+					if err != nil {
+						continue
+					}
+					for _, ne := range nestedEntries {
+						if !ne.IsDir() {
+							scanFile(filepath.Join(scriptsDir, e.Name(), se.Name(), ne.Name()), pyImports, nodeImports, binaries)
+						}
+					}
 					continue
 				}
 				scanFile(filepath.Join(scriptsDir, e.Name(), se.Name()), pyImports, nodeImports, binaries)
 			}
 			continue
+		}
+		// Track sibling .py files as local modules so cross-file imports
+		// (e.g. "from extract_form_field_info import ...") are not reported as pip deps.
+		if strings.HasSuffix(e.Name(), ".py") {
+			localModules[strings.TrimSuffix(e.Name(), ".py")] = true
 		}
 		scanFile(filepath.Join(scriptsDir, e.Name()), pyImports, nodeImports, binaries)
 	}
@@ -65,10 +109,11 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 	for b := range binaries {
 		m.Requires = append(m.Requires, b)
 	}
-	// Store raw import names — skip local module dirs (subdirs of scriptsDir).
-	// dep_checker.go handles stdlib/pip resolution via PYTHONPATH.
+	// Store raw import names — skip local modules and Python stdlib.
+	// Stdlib is also resolved at check time via actual import, but filtering here
+	// prevents false positives when the checker fails (timeout, env issue, crash).
 	for pkg := range pyImports {
-		if !localModules[pkg] {
+		if !localModules[pkg] && !pythonStdlib[pkg] {
 			m.RequiresPython = append(m.RequiresPython, pkg)
 		}
 	}
@@ -84,6 +129,11 @@ func scanScriptsDir(scriptsDir string) *SkillManifest {
 		m.Requires = append(m.Requires, "node")
 	}
 
+	if !m.IsEmpty() {
+		slog.Debug("dep_scanner: scanned", "dir", scriptsDir,
+			"bins", len(m.Requires), "py", len(m.RequiresPython), "node", len(m.RequiresNode))
+	}
+
 	return m
 }
 
@@ -93,6 +143,9 @@ var (
 	nodeRequireRe  = regexp.MustCompile(`require\(['"]([\w@][^'"]*)['"]\)`)
 	nodeESImportRe = regexp.MustCompile(`from\s+['"]([^'"./][^'"]*?)['"]`)
 	shebangRe      = regexp.MustCompile(`^#!\s*/usr/bin/env\s+(\S+)`)
+	// Detects JS ES module pattern: `import X from '...'` or `from '...'`.
+	// Used to skip false positives when JS imports appear inside Python string literals.
+	jsFromStringRe = regexp.MustCompile(`from\s+['"]`)
 )
 
 func scanFile(path string, pyImports, nodeImports map[string]bool, binaries map[string]bool) {
@@ -116,7 +169,10 @@ func scanFile(path string, pyImports, nodeImports map[string]bool, binaries map[
 		for _, line := range strings.Split(content, "\n") {
 			line = strings.TrimSpace(line)
 			if m := pyImportRe.FindStringSubmatch(line); len(m) > 1 {
-				pyImports[m[1]] = true
+				// Skip JS ES module imports inside string literals (e.g. `import mermaid from '...'`)
+				if !jsFromStringRe.MatchString(line) {
+					pyImports[m[1]] = true
+				}
 			}
 			if m := pyFromRe.FindStringSubmatch(line); len(m) > 1 {
 				pyImports[m[1]] = true
@@ -148,6 +204,8 @@ func normalizeNodePkg(pkg string) string {
 }
 
 // MergeDeps merges two manifests, deduplicating entries.
+// Manifest-origin fields (Explicit, ExcludeDeps, FromManifest) are OR-folded /
+// unioned so the merged result remains authoritative if either side was.
 func MergeDeps(a, b *SkillManifest) *SkillManifest {
 	if a == nil {
 		return b
@@ -159,6 +217,9 @@ func MergeDeps(a, b *SkillManifest) *SkillManifest {
 		Requires:       mergeUnique(a.Requires, b.Requires),
 		RequiresPython: mergeUnique(a.RequiresPython, b.RequiresPython),
 		RequiresNode:   mergeUnique(a.RequiresNode, b.RequiresNode),
+		Explicit:       mergeUnique(a.Explicit, b.Explicit),
+		ExcludeDeps:    mergeUnique(a.ExcludeDeps, b.ExcludeDeps),
+		FromManifest:   a.FromManifest || b.FromManifest,
 	}
 }
 

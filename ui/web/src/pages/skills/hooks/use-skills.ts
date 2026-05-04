@@ -4,9 +4,27 @@ import { useWs, useHttp } from "@/hooks/use-ws";
 import { useAuthStore } from "@/stores/use-auth-store";
 import { Methods } from "@/api/protocol";
 import { queryKeys } from "@/lib/query-keys";
+import { toast } from "@/stores/use-toast-store";
+import i18next from "i18next";
+import { userFriendlyError } from "@/lib/error-utils";
 import type { SkillInfo, SkillFile, SkillVersions } from "@/types/skill";
 
 export type { SkillInfo, SkillFile, SkillVersions };
+
+export type SkillUploadResponse = {
+  /** Absent when status is "unchanged" */
+  id?: string;
+  slug: string;
+  version: number;
+  name: string;
+  /** "active" | "unchanged" | "archived" */
+  status?: string;
+  is_new?: boolean;
+  deps_warning?: string;
+  deps_errors?: string[];
+  missing_deps?: string[];
+  deps_installed?: boolean;
+};
 
 export function useSkills() {
   const ws = useWs();
@@ -33,7 +51,7 @@ export function useSkills() {
   // even if the SKILL_DEPS_* events were emitted before the client connected.
   useEffect(() => {
     if (connected) invalidate();
-  }, [connected]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [connected]);  
 
   const getSkill = useCallback(
     async (name: string) => {
@@ -47,7 +65,7 @@ export function useSkills() {
     async (file: File) => {
       const formData = new FormData();
       formData.append("file", file);
-      const res = await http.upload<{ id: string; slug: string; version: number; name: string }>(
+      const res = await http.upload<SkillUploadResponse>(
         "/v1/skills/upload",
         formData,
       );
@@ -59,18 +77,30 @@ export function useSkills() {
 
   const updateSkill = useCallback(
     async (id: string, updates: Record<string, unknown>) => {
-      const res = await http.put<{ ok: string }>(`/v1/skills/${id}`, updates);
-      await invalidate();
-      return res;
+      try {
+        const res = await http.put<{ ok: string }>(`/v1/skills/${id}`, updates);
+        await invalidate();
+        toast.success(i18next.t("skills:toast.updated"));
+        return res;
+      } catch (err) {
+        toast.error(i18next.t("skills:toast.updateFailed"), userFriendlyError(err));
+        throw err;
+      }
     },
     [http, invalidate],
   );
 
   const deleteSkill = useCallback(
     async (id: string) => {
-      const res = await http.delete<{ ok: string }>(`/v1/skills/${id}`);
-      await invalidate();
-      return res;
+      try {
+        const res = await http.delete<{ ok: string }>(`/v1/skills/${id}`);
+        await invalidate();
+        toast.success(i18next.t("skills:toast.deleted"));
+        return res;
+      } catch (err) {
+        toast.error(i18next.t("skills:toast.deleteFailed"), userFriendlyError(err));
+        throw err;
+      }
     },
     [http, invalidate],
   );
@@ -103,12 +133,22 @@ export function useSkills() {
 
   const rescanDeps = useCallback(
     async () => {
-      const res = await http.post<{ updated: number; results: Array<{ slug: string; status: string; missing?: string[] }> }>(
-        "/v1/skills/rescan-deps",
-        {},
-      );
-      await invalidate();
-      return res;
+      try {
+        const res = await http.post<{ updated: number; results: Array<{ slug: string; status: string; missing?: string[] }> }>(
+          "/v1/skills/rescan-deps",
+          {},
+        );
+        await invalidate();
+        if (res.updated > 0) {
+          toast.success(i18next.t("skills:toast.rescanUpdated", { count: res.updated }));
+        } else {
+          toast.info(i18next.t("skills:toast.rescanNoChanges"));
+        }
+        return res;
+      } catch (err) {
+        toast.error(i18next.t("skills:toast.rescanFailed"), userFriendlyError(err));
+        throw err;
+      }
     },
     [http, invalidate],
   );
@@ -149,9 +189,38 @@ export function useSkills() {
     [http, invalidate],
   );
 
+  const setTenantConfig = useCallback(
+    async (id: string, enabled: boolean) => {
+      try {
+        await http.put(`/v1/skills/${id}/tenant-config`, { enabled });
+        await invalidate();
+        toast.success(i18next.t("skills:toast.updated"));
+      } catch (err) {
+        toast.error(i18next.t("skills:toast.updateFailed"), userFriendlyError(err));
+        throw err;
+      }
+    },
+    [http, invalidate],
+  );
+
+  const deleteTenantConfig = useCallback(
+    async (id: string) => {
+      try {
+        await http.delete(`/v1/skills/${id}/tenant-config`);
+        await invalidate();
+        toast.success(i18next.t("skills:toast.updated"));
+      } catch (err) {
+        toast.error(i18next.t("skills:toast.updateFailed"), userFriendlyError(err));
+        throw err;
+      }
+    },
+    [http, invalidate],
+  );
+
   return {
     skills, loading, refresh: invalidate, getSkill,
     uploadSkill, updateSkill, deleteSkill,
     getSkillVersions, getSkillFiles, getSkillFileContent, rescanDeps, installDeps, installSingleDep, toggleSkill,
+    setTenantConfig, deleteTenantConfig,
   };
 }

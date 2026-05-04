@@ -16,7 +16,6 @@ import { AiDefaultsSection } from "./sections/ai-defaults-section";
 import { QuotaSection } from "./sections/quota-section";
 import { ToolsProfileSection } from "./sections/tools-profile-section";
 import { ToolsExecSection } from "./sections/tools-exec-section";
-import { ToolsWebSection } from "./sections/tools-web-section";
 import { ShellSecuritySection } from "./sections/shell-security-section";
 import { TtsSection } from "./sections/tts-section";
 import { CronSection } from "./sections/cron-section";
@@ -32,7 +31,7 @@ export function ConfigPage() {
 
   if (showSkeleton) {
     return (
-      <div className="p-4 sm:p-6">
+      <div className="p-4 sm:p-6 pb-10">
         <PageHeader title={t("title")} description={t("description")} />
         <div className="mt-6">
           <DetailSkeleton />
@@ -43,7 +42,7 @@ export function ConfigPage() {
 
   if (!config) {
     return (
-      <div className="p-4 sm:p-6">
+      <div className="p-4 sm:p-6 pb-10">
         <PageHeader title={t("title")} description={t("description")} />
         <div className="mt-6">
           <EmptyState
@@ -62,7 +61,7 @@ export function ConfigPage() {
   }
 
   return (
-    <div className="p-4 sm:p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
         title={t("title")}
         description={t("description")}
@@ -140,11 +139,6 @@ export function ConfigPage() {
             saving={saving}
           />
           <ToolsExecSection
-            data={config.tools as any}
-            onSave={(v) => patch({ tools: v })}
-            saving={saving}
-          />
-          <ToolsWebSection
             data={config.tools as any}
             onSave={(v) => patch({ tools: v })}
             saving={saving}

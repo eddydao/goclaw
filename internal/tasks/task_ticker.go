@@ -13,14 +13,16 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 const (
-	defaultRecoveryInterval = 5 * time.Minute
-	defaultStaleThreshold   = 2 * time.Hour
-	followupCooldown        = 5 * time.Minute
-	defaultFollowupInterval = 30 * time.Minute
+	defaultRecoveryInterval  = 5 * time.Minute
+	defaultStaleThreshold    = 2 * time.Hour
+	defaultInReviewThreshold = 4 * time.Hour
+	followupCooldown         = 5 * time.Minute
+	defaultFollowupInterval  = 30 * time.Minute
 )
 
 // TaskTicker periodically recovers stale tasks and re-dispatches pending work.
@@ -89,26 +91,31 @@ func (t *TaskTicker) loop() {
 }
 
 func (t *TaskTicker) recoverAll(forceRecover bool) {
-	ctx := context.Background()
-
-	// Step 1: Batch followups (before recovery — recovery resets in_progress→pending,
-	// which would make followup tasks invisible since followup queries status='in_progress').
-	t.processFollowups(ctx)
+	// Step 1: Batch followups with own timeout (before recovery — recovery resets
+	// in_progress→pending, which would make followup tasks invisible since followup
+	// queries status='in_progress').
+	followupCtx, followupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	t.processFollowups(followupCtx)
+	followupCancel()
 
 	// Step 2: Batch recovery — single query across all v2 active teams.
+	// Separate timeout so followup duration doesn't eat into recovery budget.
+	recoverCtx, recoverCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer recoverCancel()
+
 	var recovered []store.RecoveredTaskInfo
 	var err error
 	if forceRecover {
-		recovered, err = t.teams.ForceRecoverAllTasks(ctx)
+		recovered, err = t.teams.ForceRecoverAllTasks(recoverCtx)
 	} else {
-		recovered, err = t.teams.RecoverAllStaleTasks(ctx)
+		recovered, err = t.teams.RecoverAllStaleTasks(recoverCtx)
 	}
 	if err != nil {
 		slog.Warn("task_ticker: batch recovery", "force", forceRecover, "error", err)
 	}
 	if len(recovered) > 0 {
 		slog.Info("task_ticker: recovered tasks", "count", len(recovered), "force", forceRecover)
-		t.notifyLeaders(ctx, recovered, "recovered (lock expired)",
+		t.notifyLeaders(recoverCtx, recovered, "recovered (lock expired)",
 			"These tasks were reset to pending because the assigned agent stopped responding.\n"+
 				"To re-dispatch: use team_tasks(action=\"retry\", task_id=\"<task_id>\") for each task above.\n"+
 				"To cancel: use team_tasks(action=\"update\", task_id=\"<task_id>\", status=\"cancelled\").\n"+
@@ -117,21 +124,49 @@ func (t *TaskTicker) recoverAll(forceRecover bool) {
 
 	// Step 3: Batch mark stale — pending tasks older than 2h.
 	staleThreshold := time.Now().Add(-defaultStaleThreshold)
-	stale, err := t.teams.MarkAllStaleTasks(ctx, staleThreshold)
+	stale, err := t.teams.MarkAllStaleTasks(recoverCtx, staleThreshold)
 	if err != nil {
 		slog.Warn("task_ticker: batch mark stale", "error", err)
 	}
 	if len(stale) > 0 {
 		slog.Info("task_ticker: marked stale", "count", len(stale))
-		t.notifyLeaders(ctx, stale, "marked stale (no progress for 2+ hours)",
+		t.notifyLeaders(recoverCtx, stale, "marked stale (no progress for 2+ hours)",
 			"These tasks have been pending too long without being picked up.\n"+
 				"To re-dispatch: use team_tasks(action=\"retry\", task_id=\"<task_id>\").\n"+
 				"To cancel: use team_tasks(action=\"update\", task_id=\"<task_id>\", status=\"cancelled\").\n"+
 				"To view current board: use team_tasks(action=\"list\").")
-		t.broadcastStaleEvents(ctx, stale)
+		t.broadcastStaleEvents(recoverCtx, stale)
 	}
 
-	// Step 4: Prune old cooldown entries to prevent memory leak.
+	// Step 4: Mark in_review tasks stale after 4 hours.
+	inReviewThreshold := time.Now().Add(-defaultInReviewThreshold)
+	staleReview, err := t.teams.MarkInReviewStaleTasks(recoverCtx, inReviewThreshold)
+	if err != nil {
+		slog.Warn("task_ticker: batch mark in_review stale", "error", err)
+	}
+	if len(staleReview) > 0 {
+		slog.Info("task_ticker: marked in_review stale", "count", len(staleReview))
+		t.notifyLeaders(recoverCtx, staleReview, "in review too long (4+ hours) — marked stale",
+			"These tasks have been waiting for approval too long.\n"+
+				"To approve: use team_tasks(action=\"approve\", task_id=\"<task_id>\").\n"+
+				"To reject: use team_tasks(action=\"reject\", task_id=\"<task_id>\", text=\"reason\").\n"+
+				"To retry: use team_tasks(action=\"retry\", task_id=\"<task_id>\").")
+		t.broadcastStaleEvents(recoverCtx, staleReview)
+	}
+
+	// Step 5: Fix orphaned blocked tasks where all blockers are terminal.
+	fixed, err := t.teams.FixOrphanedBlockedTasks(recoverCtx)
+	if err != nil {
+		slog.Warn("task_ticker: fix orphaned blocked tasks", "error", err)
+	}
+	if len(fixed) > 0 {
+		slog.Info("task_ticker: auto-unblocked orphaned tasks", "count", len(fixed))
+		t.notifyLeaders(recoverCtx, fixed, "auto-unblocked (all blockers resolved)",
+			"These blocked tasks were automatically unblocked because all their dependencies completed.\n"+
+				"They are now pending and will be dispatched if assigned.")
+	}
+
+	// Step 6: Prune old cooldown entries to prevent memory leak.
 	t.pruneCooldowns()
 }
 
@@ -140,9 +175,10 @@ func (t *TaskTicker) recoverAll(forceRecover bool) {
 // ============================================================
 
 type taskScope struct {
-	TeamID  uuid.UUID
-	Channel string // from task's origin channel
-	ChatID  string
+	TeamID   uuid.UUID
+	TenantID uuid.UUID
+	Channel  string // from task's origin channel
+	ChatID   string
 }
 
 // notifyLeaders sends a batched system message per (teamID, channel, chatID) scope to the leader.
@@ -154,32 +190,64 @@ func (t *TaskTicker) notifyLeaders(ctx context.Context, tasks []store.RecoveredT
 	// Group by (team_id, channel, chat_id) → one message per scope.
 	byScope := map[taskScope][]store.RecoveredTaskInfo{}
 	for _, task := range tasks {
-		key := taskScope{TeamID: task.TeamID, Channel: task.Channel, ChatID: task.ChatID}
+		key := taskScope{TeamID: task.TeamID, TenantID: task.TenantID, Channel: task.Channel, ChatID: task.ChatID}
 		byScope[key] = append(byScope[key], task)
 	}
 
 	// Cache team+lead lookups (same team may have multiple scopes).
-	teamCache := map[uuid.UUID]*store.TeamData{}
-	leadCache := map[uuid.UUID]*store.AgentData{}
+	// Composite key includes TenantID to clarify multi-tenant intent (UUIDs are globally
+	// unique but composite key makes the isolation boundary explicit and future-proof).
+	type teamCacheKey struct {
+		TeamID   uuid.UUID
+		TenantID uuid.UUID
+	}
+	type leadCacheKey struct {
+		AgentID  uuid.UUID
+		TenantID uuid.UUID
+	}
+	teamCache := map[teamCacheKey]*store.TeamData{}
+	leadCache := map[leadCacheKey]*store.AgentData{}
 
 	for scope, scopeTasks := range byScope {
-		team := teamCache[scope.TeamID]
+		// Inject tenant into ctx so store lookups (GetTeam, GetByID, GetTask) apply the
+		// correct tenant filter. Without this, PGTeamStore.GetTeam silently returns
+		// (nil, nil) when ctx has no tenant — causing a nil-deref panic on team.LeadAgentID.
+		scopeCtx := ctx
+		if scope.TenantID != uuid.Nil {
+			scopeCtx = store.WithTenantID(ctx, scope.TenantID)
+		}
+
+		teamKey := teamCacheKey{TeamID: scope.TeamID, TenantID: scope.TenantID}
+		team := teamCache[teamKey]
 		if team == nil {
 			var err error
-			team, err = t.teams.GetTeam(ctx, scope.TeamID)
+			team, err = t.teams.GetTeam(scopeCtx, scope.TeamID)
 			if err != nil {
+				slog.Warn("task_ticker: get team failed", "team_id", scope.TeamID, "tenant_id", scope.TenantID, "error", err)
 				continue
 			}
-			teamCache[scope.TeamID] = team
+			if team == nil {
+				// GetTeam can return (nil, nil) when tenant ctx is missing or team is deleted.
+				slog.Warn("task_ticker: team not found (nil)", "team_id", scope.TeamID, "tenant_id", scope.TenantID)
+				continue
+			}
+			teamCache[teamKey] = team
 		}
-		lead := leadCache[team.LeadAgentID]
+
+		leadKey := leadCacheKey{AgentID: team.LeadAgentID, TenantID: scope.TenantID}
+		lead := leadCache[leadKey]
 		if lead == nil {
 			var err error
-			lead, err = t.agents.GetByID(ctx, team.LeadAgentID)
+			lead, err = t.agents.GetByID(scopeCtx, team.LeadAgentID)
 			if err != nil {
+				slog.Warn("task_ticker: get lead agent failed", "agent_id", team.LeadAgentID, "tenant_id", scope.TenantID, "error", err)
 				continue
 			}
-			leadCache[team.LeadAgentID] = lead
+			if lead == nil {
+				slog.Warn("task_ticker: lead agent not found (nil)", "agent_id", team.LeadAgentID, "tenant_id", scope.TenantID)
+				continue
+			}
+			leadCache[leadKey] = lead
 		}
 
 		// Build batched task list with clear actionable hints.
@@ -199,12 +267,42 @@ func (t *TaskTicker) notifyLeaders(ctx context.Context, tasks []store.RecoveredT
 			chatID = scope.TeamID.String()
 		}
 
+		// Resolve PeerKind from first task's metadata for correct session routing (#266).
+		var peerKind string
+		var fullTask *store.TeamTaskData
+		if task, err := t.teams.GetTask(scopeCtx, scopeTasks[0].ID); err == nil {
+			fullTask = task
+			if fullTask != nil && fullTask.Metadata != nil {
+				if pk, ok := fullTask.Metadata["peer_kind"].(string); ok {
+					peerKind = pk
+				}
+			}
+		}
+
+		// Build metadata: local_key for forum routing + origin sender/role for permission checks.
+		// Ticker context has no real sender, so propagate from task metadata (#915 deferred dispatch).
+		tickerMeta := tools.TaskLocalKeyMetadata(fullTask)
+		if tickerMeta == nil {
+			tickerMeta = map[string]string{}
+		}
+		if fullTask != nil && fullTask.Metadata != nil {
+			if s, ok := fullTask.Metadata["origin_sender_id"].(string); ok && s != "" {
+				tickerMeta[tools.MetaOriginSenderID] = s
+			}
+			if r, ok := fullTask.Metadata["origin_role"].(string); ok && r != "" {
+				tickerMeta[tools.MetaOriginRole] = r
+			}
+		}
+
 		if !t.msgBus.TryPublishInbound(bus.InboundMessage{
 			Channel:  channel,
 			SenderID: "ticker:system",
 			ChatID:   chatID,
+			Metadata: tickerMeta,
 			AgentID:  lead.AgentKey,
 			UserID:   team.CreatedBy,
+			PeerKind: peerKind,
+			TenantID: scope.TenantID,
 			Content:  content,
 		}) {
 			slog.Warn("task_ticker: inbound buffer full, notification dropped",
@@ -225,16 +323,11 @@ func (t *TaskTicker) broadcastStaleEvents(ctx context.Context, tasks []store.Rec
 			continue
 		}
 		seen[task.TeamID] = true
-		t.msgBus.Broadcast(bus.Event{
-			Name: protocol.EventTeamTaskStale,
-			Payload: protocol.TeamTaskEventPayload{
-				TeamID:    task.TeamID.String(),
-				Status:    store.TeamTaskStatusStale,
-				Timestamp: time.Now().UTC().Format("2006-01-02T15:04:05Z"),
-				ActorType: "system",
-				ActorID:   "task_ticker",
-			},
-		})
+		bus.BroadcastForTenant(t.msgBus, protocol.EventTeamTaskStale, task.TenantID, tools.BuildTaskEventPayload(
+			task.TeamID.String(), "",
+			store.TeamTaskStatusStale,
+			"system", "task_ticker",
+		))
 	}
 }
 
@@ -258,12 +351,27 @@ func (t *TaskTicker) processFollowups(ctx context.Context) {
 		byTeam[task.TeamID] = append(byTeam[task.TeamID], task)
 	}
 	for teamID, teamTasks := range byTeam {
-		team, err := t.teams.GetTeam(ctx, teamID)
+		if len(teamTasks) == 0 {
+			continue
+		}
+		tenantID := teamTasks[0].TenantID
+		scopeCtx := ctx
+		if tenantID != uuid.Nil {
+			scopeCtx = store.WithTenantID(ctx, tenantID)
+		}
+		team, err := t.teams.GetTeam(scopeCtx, teamID)
 		if err != nil {
+			slog.Warn("task_ticker: followups get team failed",
+				"team_id", teamID, "tenant_id", tenantID, "error", err)
+			continue
+		}
+		if team == nil {
+			slog.Warn("task_ticker: followups team not found (nil)",
+				"team_id", teamID, "tenant_id", tenantID)
 			continue
 		}
 		interval := followupInterval(*team)
-		t.processTeamFollowups(ctx, teamTasks, interval)
+		t.processTeamFollowups(scopeCtx, teamTasks, interval)
 	}
 }
 
@@ -293,11 +401,7 @@ func (t *TaskTicker) processTeamFollowups(ctx context.Context, tasks []store.Tea
 		}
 		content := fmt.Sprintf("Reminder (%s): %s", countLabel, task.FollowupMessage)
 
-		if !t.msgBus.TryPublishOutbound(bus.OutboundMessage{
-			Channel: task.FollowupChannel,
-			ChatID:  task.FollowupChatID,
-			Content: content,
-		}) {
+		if !t.msgBus.TryPublishOutbound(followupOutboundMessage(task, content)) {
 			slog.Warn("task_ticker: outbound buffer full, skipping followup", "task_id", task.ID)
 			continue
 		}
@@ -327,6 +431,16 @@ func (t *TaskTicker) processTeamFollowups(ctx context.Context, tasks []store.Tea
 			"team_id", task.TeamID,
 		)
 	}
+}
+
+func followupOutboundMessage(task *store.TeamTaskData, content string) bus.OutboundMessage {
+	message := bus.OutboundMessage{
+		Channel: task.FollowupChannel,
+		ChatID:  task.FollowupChatID,
+		Content: content,
+	}
+	message.Metadata = tools.TaskLocalKeyMetadata(task)
+	return message
 }
 
 // followupInterval parses the team's followup_interval_minutes setting.

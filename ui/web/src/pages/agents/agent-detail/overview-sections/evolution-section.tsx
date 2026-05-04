@@ -1,10 +1,12 @@
 import { useTranslation } from "react-i18next";
-import { GraduationCap, Info, Sparkles } from "lucide-react";
+import { GraduationCap, Info, Sparkles, BarChart3, Lightbulb } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { useV3Flags } from "@/hooks/use-v3-flags";
 
 interface EvolutionSectionProps {
+  agentId: string;
   selfEvolve: boolean;
   onSelfEvolveChange: (v: boolean) => void;
   skillEvolve: boolean;
@@ -14,21 +16,23 @@ interface EvolutionSectionProps {
 }
 
 export function EvolutionSection({
+  agentId,
   selfEvolve, onSelfEvolveChange,
   skillEvolve, onSkillEvolveChange,
   skillNudgeInterval, onSkillNudgeIntervalChange,
 }: EvolutionSectionProps) {
   const { t } = useTranslation("agents");
+  const { flags, toggleFlag } = useV3Flags(agentId);
 
   return (
     <section className="space-y-4 rounded-lg border p-3 sm:p-4">
-      <h3 className="text-sm font-medium">{t("detail.evolution")}</h3>
+      <h3 className="text-sm font-medium">{t("detail.evolution.title")}</h3>
 
       {/* Self-Evolve */}
       <div className="space-y-2">
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2">
-            <Sparkles className="h-4 w-4 text-violet-500 shrink-0" />
+            <Sparkles className="h-4 w-4 text-orange-500 shrink-0" />
             <div className="space-y-0.5">
               <Label htmlFor="self-evolve" className="text-sm font-normal cursor-pointer">
                 {t("general.selfEvolutionLabel")}
@@ -39,7 +43,7 @@ export function EvolutionSection({
           <Switch id="self-evolve" checked={selfEvolve} onCheckedChange={onSelfEvolveChange} />
         </div>
         {selfEvolve && (
-          <div className="flex items-start gap-2 rounded-md border border-violet-200 bg-violet-50 px-3 py-2 text-xs text-violet-700 dark:border-violet-800 dark:bg-violet-950/30 dark:text-violet-300">
+          <div className="flex items-start gap-2 rounded-md border border-orange-200 bg-orange-50 px-3 py-2 text-xs text-orange-700 dark:border-orange-800 dark:bg-orange-950/30 dark:text-orange-300">
             <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
             <span>{t("general.selfEvolutionInfo")}</span>
           </div>
@@ -84,6 +88,47 @@ export function EvolutionSection({
           </>
         )}
       </div>
+
+      {/* V3 Evolution Metrics (stored in other_config via v3-flags API) */}
+      {flags && (
+        <>
+          <div className="border-t pt-3 mt-3" />
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2">
+              <BarChart3 className="h-4 w-4 text-cyan-500 shrink-0" />
+              <div className="space-y-0.5">
+                <Label htmlFor="evo-metrics" className="text-sm font-normal cursor-pointer">
+                  {t("detail.evolution.metricsLabel")}
+                </Label>
+                <p className="text-xs text-muted-foreground">{t("detail.evolution.metricsHint")}</p>
+              </div>
+            </div>
+            <Switch
+              id="evo-metrics"
+              checked={flags.self_evolution_metrics}
+              onCheckedChange={(v) => toggleFlag("self_evolution_metrics", v)}
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-4">
+            <div className="flex items-center gap-2">
+              <Lightbulb className="h-4 w-4 text-yellow-500 shrink-0" />
+              <div className="space-y-0.5">
+                <Label htmlFor="evo-suggestions" className="text-sm font-normal cursor-pointer">
+                  {t("detail.evolution.suggestionsLabel")}
+                </Label>
+                <p className="text-xs text-muted-foreground">{t("detail.evolution.suggestionsHint")}</p>
+              </div>
+            </div>
+            <Switch
+              id="evo-suggestions"
+              checked={flags.self_evolution_suggestions}
+              onCheckedChange={(v) => toggleFlag("self_evolution_suggestions", v)}
+            />
+          </div>
+        </>
+      )}
     </section>
   );
 }

@@ -1,49 +1,19 @@
-export const ROUTES = {
-  LOGIN: "/login",
-  OVERVIEW: "/overview",
-  CHAT: "/chat",
-  CHAT_SESSION: "/chat/:sessionKey",
-  AGENTS: "/agents",
-  AGENT_DETAIL: "/agents/:id",
-  SESSIONS: "/sessions",
-  SESSION_DETAIL: "/sessions/:key",
-  SKILLS: "/skills",
-  SKILL_DETAIL: "/skills/:id",
-  CRON: "/cron",
-  CRON_DETAIL: "/cron/:id",
-  CONFIG: "/config",
-  TRACES: "/traces",
-  TRACE_DETAIL: "/traces/:id",
-  EVENTS: "/events",
-  USAGE: "/usage",
-  CHANNELS: "/channels",
-  CHANNEL_DETAIL: "/channels/:id",
-  CONTACTS: "/contacts",
-  APPROVALS: "/approvals",
-  NODES: "/nodes",
-  LOGS: "/logs",
-  PROVIDERS: "/providers",
-  TEAMS: "/teams",
-  TEAM_DETAIL: "/teams/:id",
-  CUSTOM_TOOLS: "/custom-tools",
-  BUILTIN_TOOLS: "/builtin-tools",
-  CLI_CREDENTIALS: "/cli-credentials",
-  MCP: "/mcp",
-  TTS: "/tts",
-  STORAGE: "/storage",
-  PENDING_MESSAGES: "/pending-messages",
-  MEMORY: "/memory",
-  KNOWLEDGE_GRAPH: "/knowledge-graph",
-  ACTIVITY: "/activity",
-  API_KEYS: "/api-keys",
-  PACKAGES: "/packages",
-  SETUP: "/setup",
-} as const;
+// Barrel re-exports for backward compatibility.
+// Import directly from sub-modules for new code.
+export { ROUTES } from "./routes";
+export {
+  TIMEZONE_OPTIONS,
+  getAllIanaTimezones,
+  isValidIanaTimezone,
+} from "./timezone-utils";
 
 export const LOCAL_STORAGE_KEYS = {
   TOKEN: "goclaw:token",
   USER_ID: "goclaw:userId",
   SENDER_ID: "goclaw:senderID",
+  TENANT_ID: "goclaw:tenant_id",
+  TENANT_HINT: "goclaw:tenant_hint",
+  SETUP_SKIPPED: "goclaw:setup_skipped",
   THEME: "goclaw:theme",
   SIDEBAR_COLLAPSED: "goclaw:sidebarCollapsed",
   LANGUAGE: "goclaw:language",
@@ -58,19 +28,3 @@ export const LANGUAGE_LABELS: Record<Language, string> = {
   vi: "Tiếng Việt",
   zh: "中文",
 };
-
-/** "auto" = browser's local timezone. */
-export const TIMEZONE_OPTIONS = [
-  { value: "auto", label: "Auto (Local)" },
-  { value: "UTC", label: "UTC" },
-  { value: "America/New_York", label: "New York (ET)" },
-  { value: "America/Chicago", label: "Chicago (CT)" },
-  { value: "America/Los_Angeles", label: "Los Angeles (PT)" },
-  { value: "Europe/London", label: "London (GMT/BST)" },
-  { value: "Europe/Paris", label: "Paris (CET)" },
-  { value: "Asia/Tokyo", label: "Tokyo (JST)" },
-  { value: "Asia/Shanghai", label: "Shanghai (CST)" },
-  { value: "Asia/Ho_Chi_Minh", label: "Ho Chi Minh (ICT)" },
-  { value: "Asia/Singapore", label: "Singapore (SGT)" },
-  { value: "Australia/Sydney", label: "Sydney (AEST)" },
-] as const;

@@ -28,20 +28,24 @@ func loopbackAddr(host string, port int) string {
 	return net.JoinHostPort(host, strconv.Itoa(port))
 }
 
-func registerProviders(registry *providers.Registry, cfg *config.Config) {
+func registerProviders(registry *providers.Registry, cfg *config.Config, modelReg providers.ModelRegistry) {
 	if cfg.Providers.Anthropic.APIKey != "" {
 		registry.Register(providers.NewAnthropicProvider(cfg.Providers.Anthropic.APIKey,
-			providers.WithAnthropicBaseURL(cfg.Providers.Anthropic.APIBase)))
+			providers.WithAnthropicBaseURL(cfg.Providers.Anthropic.APIBase),
+			providers.WithAnthropicRegistry(modelReg)))
 		slog.Info("registered provider", "name", "anthropic")
 	}
 
 	if cfg.Providers.OpenAI.APIKey != "" {
-		registry.Register(providers.NewOpenAIProvider("openai", cfg.Providers.OpenAI.APIKey, cfg.Providers.OpenAI.APIBase, "gpt-4o"))
+		registry.Register(providers.NewOpenAIProvider("openai", cfg.Providers.OpenAI.APIKey, cfg.Providers.OpenAI.APIBase, "gpt-4o").
+			WithRegistry(modelReg))
 		slog.Info("registered provider", "name", "openai")
 	}
 
 	if cfg.Providers.OpenRouter.APIKey != "" {
-		registry.Register(providers.NewOpenAIProvider("openrouter", cfg.Providers.OpenRouter.APIKey, "https://openrouter.ai/api/v1", "anthropic/claude-sonnet-4-5-20250929"))
+		orProv := providers.NewOpenAIProvider("openrouter", cfg.Providers.OpenRouter.APIKey, "https://openrouter.ai/api/v1", "anthropic/claude-sonnet-4-5-20250929")
+		orProv.WithSiteInfo("https://goclaw.sh", "GoClaw")
+		registry.Register(orProv)
 		slog.Info("registered provider", "name", "openrouter")
 	}
 
@@ -134,6 +138,40 @@ func registerProviders(registry *providers.Registry, cfg *config.Config) {
 		}
 		registry.Register(providers.NewOpenAIProvider("ollama-cloud", cfg.Providers.OllamaCloud.APIKey, base, "llama3.3"))
 		slog.Info("registered provider", "name", "ollama-cloud")
+	}
+
+	// Novita AI — OpenAI-compatible endpoint.
+	if cfg.Providers.Novita.APIKey != "" {
+		base := cfg.Providers.Novita.APIBase
+		if base == "" {
+			base = store.NovitaDefaultAPIBase
+		}
+		registry.Register(providers.NewOpenAIProvider("novita", cfg.Providers.Novita.APIKey, base, store.NovitaDefaultModel))
+		slog.Info("registered provider", "name", "novita")
+	}
+
+	// BytePlus ModelArk — OpenAI-compatible (standard Bearer auth).
+	if cfg.Providers.BytePlus.APIKey != "" {
+		base := cfg.Providers.BytePlus.APIBase
+		if base == "" {
+			base = store.BytePlusDefaultAPIBase
+		}
+		prov := providers.NewOpenAIProvider("byteplus", cfg.Providers.BytePlus.APIKey, base, store.BytePlusDefaultModel)
+		prov.WithProviderType(store.ProviderBytePlus)
+		registry.Register(prov)
+		slog.Info("registered provider", "name", "byteplus")
+	}
+
+	// BytePlus ModelArk Coding Plan — separate endpoint for developer tools quota.
+	if cfg.Providers.BytePlusCoding.APIKey != "" {
+		base := cfg.Providers.BytePlusCoding.APIBase
+		if base == "" {
+			base = store.BytePlusCodingDefaultAPIBase
+		}
+		prov := providers.NewOpenAIProvider("byteplus-coding", cfg.Providers.BytePlusCoding.APIKey, base, store.BytePlusDefaultModel)
+		prov.WithProviderType(store.ProviderBytePlusCoding)
+		registry.Register(prov)
+		slog.Info("registered provider", "name", "byteplus-coding")
 	}
 
 	// Claude CLI provider (subscription-based, no API key needed)
@@ -231,9 +269,9 @@ func jsonToStringMap(data json.RawMessage) map[string]string {
 // DB providers are registered after config providers, so they take precedence (overwrite).
 // gatewayAddr is used to inject GoClaw MCP bridge for Claude CLI providers.
 // mcpStore is optional; when provided, per-agent MCP servers are injected into CLI config.
-func registerProvidersFromDB(registry *providers.Registry, provStore store.ProviderStore, secretStore store.ConfigSecretsStore, gatewayAddr, gatewayToken string, mcpStore store.MCPServerStore) {
-	ctx := context.Background()
-	dbProviders, err := provStore.ListProviders(ctx)
+// cfg provides fallback api_base values from config/env when DB providers have none set.
+func registerProvidersFromDB(registry *providers.Registry, provStore store.ProviderStore, secretStore store.ConfigSecretsStore, gatewayAddr, gatewayToken string, mcpStore store.MCPServerStore, cfg *config.Config, modelReg providers.ModelRegistry) {
+	dbProviders, err := provStore.ListAllProviders(context.Background())
 	if err != nil {
 		slog.Warn("failed to load providers from DB", "error", err)
 		return
@@ -258,13 +296,14 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 				continue
 			}
 			var cliOpts []providers.ClaudeCLIOption
+			cliOpts = append(cliOpts, providers.WithClaudeCLIName(p.Name))
 			cliOpts = append(cliOpts, providers.WithClaudeCLISecurityHooks("", true))
 			if gatewayAddr != "" {
 				mcpData := providers.BuildCLIMCPConfigData(nil, gatewayAddr, gatewayToken)
 				mcpData.AgentMCPLookup = buildMCPServerLookup(mcpStore)
 				cliOpts = append(cliOpts, providers.WithClaudeCLIMCPConfigData(mcpData))
 			}
-			registry.Register(providers.NewClaudeCLIProvider(cliPath, cliOpts...))
+			registry.RegisterForTenant(p.TenantID, providers.NewClaudeCLIProvider(cliPath, cliOpts...))
 			slog.Info("registered provider from DB", "name", p.Name)
 			continue
 		}
@@ -274,12 +313,13 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 			continue
 		}
 		// Local Ollama requires no API key — handle before the key guard (same pattern as ClaudeCLI).
+		// api_base is stored with /v1 (normalized at write time), so no suffix appending needed.
 		if p.ProviderType == store.ProviderOllama {
 			host := p.APIBase
 			if host == "" {
-				host = "http://localhost:11434"
+				host = "http://localhost:11434/v1"
 			}
-			registry.Register(providers.NewOpenAIProvider(p.Name, "ollama", host+"/v1", "llama3.3"))
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, "ollama", config.DockerLocalhost(host), "llama3.3"))
 			slog.Info("registered provider from DB", "name", p.Name)
 			continue
 		}
@@ -287,56 +327,84 @@ func registerProvidersFromDB(registry *providers.Registry, provStore store.Provi
 		if p.APIKey == "" {
 			continue
 		}
+		// Fall back to config/env api_base when DB provider has none set.
+		if p.APIBase == "" && cfg != nil {
+			if base := cfg.Providers.APIBaseForType(p.ProviderType); base != "" {
+				p.APIBase = base
+				slog.Info("provider api_base inherited from config", "name", p.Name, "api_base", base)
+			}
+		}
 		switch p.ProviderType {
 		case store.ProviderChatGPTOAuth:
-			ts := oauth.NewDBTokenSource(provStore, secretStore, p.Name)
-			registry.Register(providers.NewCodexProvider(p.Name, ts, p.APIBase, ""))
+			ts := oauth.NewDBTokenSource(provStore, secretStore, p.Name).WithTenantID(p.TenantID)
+			codex := providers.NewCodexProvider(p.Name, ts, p.APIBase, "")
+			if oauthSettings := store.ParseChatGPTOAuthProviderSettings(p.Settings); oauthSettings != nil {
+				codex.WithRoutingDefaults(oauthSettings.CodexPool.Strategy, oauthSettings.CodexPool.ExtraProviderNames)
+			}
+			registry.RegisterForTenant(p.TenantID, codex)
 		case store.ProviderAnthropicNative:
-			registry.Register(providers.NewAnthropicProvider(p.APIKey,
-				providers.WithAnthropicBaseURL(p.APIBase)))
+			registry.RegisterForTenant(p.TenantID, providers.NewAnthropicProvider(p.APIKey,
+				providers.WithAnthropicName(p.Name),
+				providers.WithAnthropicBaseURL(p.APIBase),
+				providers.WithAnthropicRegistry(modelReg)))
 		case store.ProviderDashScope:
-			registry.Register(providers.NewDashScopeProvider(p.Name, p.APIKey, p.APIBase, ""))
+			registry.RegisterForTenant(p.TenantID, providers.NewDashScopeProvider(p.Name, p.APIKey, p.APIBase, ""))
 		case store.ProviderBailian:
 			base := p.APIBase
 			if base == "" {
 				base = "https://coding-intl.dashscope.aliyuncs.com/v1"
 			}
-			registry.Register(providers.NewOpenAIProvider(p.Name, p.APIKey, base, "qwen3.5-plus"))
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "qwen3.5-plus"))
 		case store.ProviderZai:
 			base := p.APIBase
 			if base == "" {
 				base = "https://api.z.ai/api/paas/v4"
 			}
-			registry.Register(providers.NewOpenAIProvider(p.Name, p.APIKey, base, "glm-5"))
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "glm-5"))
 		case store.ProviderZaiCoding:
 			base := p.APIBase
 			if base == "" {
 				base = "https://api.z.ai/api/coding/paas/v4"
 			}
-			registry.Register(providers.NewOpenAIProvider(p.Name, p.APIKey, base, "glm-5"))
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "glm-5"))
 		case store.ProviderOllamaCloud:
 			base := p.APIBase
 			if base == "" {
 				base = "https://ollama.com/v1"
 			}
-			registry.Register(providers.NewOpenAIProvider(p.Name, p.APIKey, base, "llama3.3"))
-		case store.ProviderSuno:
-			// Suno is a media-only provider (music gen). Register as OpenAI-compat
-			// so credentialProvider interface works for API key/base extraction.
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, "llama3.3"))
+		case store.ProviderNovita:
 			base := p.APIBase
 			if base == "" {
-				base = "https://api.sunoapi.org"
+				base = store.NovitaDefaultAPIBase
 			}
-			prov := providers.NewOpenAIProvider(p.Name, p.APIKey, base, "")
+			registry.RegisterForTenant(p.TenantID, providers.NewOpenAIProvider(p.Name, p.APIKey, base, store.NovitaDefaultModel))
+		case store.ProviderBytePlus:
+			base := p.APIBase
+			if base == "" {
+				base = store.BytePlusDefaultAPIBase
+			}
+			prov := providers.NewOpenAIProvider(p.Name, p.APIKey, base, store.BytePlusDefaultModel)
 			prov.WithProviderType(p.ProviderType)
-			registry.Register(prov)
+			registry.RegisterForTenant(p.TenantID, prov)
+		case store.ProviderBytePlusCoding:
+			base := p.APIBase
+			if base == "" {
+				base = store.BytePlusCodingDefaultAPIBase
+			}
+			prov := providers.NewOpenAIProvider(p.Name, p.APIKey, base, store.BytePlusDefaultModel)
+			prov.WithProviderType(p.ProviderType)
+			registry.RegisterForTenant(p.TenantID, prov)
 		default:
 			prov := providers.NewOpenAIProvider(p.Name, p.APIKey, p.APIBase, "")
 			prov.WithProviderType(p.ProviderType)
 			if p.ProviderType == store.ProviderMiniMax {
 				prov.WithChatPath("/text/chatcompletion_v2")
 			}
-			registry.Register(prov)
+			if p.ProviderType == store.ProviderOpenRouter {
+				prov.WithSiteInfo("https://goclaw.sh", "GoClaw")
+			}
+			registry.RegisterForTenant(p.TenantID, prov)
 		}
 		slog.Info("registered provider from DB", "name", p.Name)
 	}
@@ -408,8 +476,9 @@ func registerACPFromDB(registry *providers.Registry, p store.LLMProviderData) {
 	if workDir == "" {
 		workDir = defaultACPWorkDir()
 	}
-	registry.Register(providers.NewACPProvider(
+	registry.RegisterForTenant(p.TenantID, providers.NewACPProvider(
 		binary, settings.Args, workDir, idleTTL, tools.DefaultDenyPatterns(),
+		providers.WithACPName(p.Name),
 		providers.WithACPModel(p.Name),
 	))
 	slog.Info("registered provider from DB", "name", p.Name, "type", "acp")

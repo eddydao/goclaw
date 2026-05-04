@@ -15,7 +15,16 @@
     "spans": "Spans",
     "time": "Time"
   },
+  "source": {
+    "direct": "Direct",
+    "group": "Group",
+    "cron": "Cron",
+    "team": "Team",
+    "ws": "Web",
+    "unknown": "Other"
+  },
   "unnamed": "Unnamed",
+  "stopRun": "Stop run",
   "cached": "cached",
   "detail": {
     "title": "Trace Detail",
@@ -36,11 +45,25 @@
     "spansCount": "Spans ({{count}})",
     "llmCalls": "LLM",
     "toolCalls": "tool",
-    "export": "Export trace"
+    "export": "Export trace",
+    "stopRun": "Stop run"
   },
   "span": {
     "model": "Model:",
     "tokens": "Tokens:",
+    "reasoning": "Reasoning:",
+    "source": "source",
+    "requested": "requested",
+    "effective": "effective",
+    "fallback": "fallback",
+    "modelDefault": "model default",
+    "supportedLevels": "supported:",
+    "sourceValue": {
+      "provider_default": "provider default",
+      "reasoning": "agent advanced",
+      "thinking_level": "legacy thinking level",
+      "unset": "unset"
+    },
     "createdAt": "Created:",
     "input": "Input:",
     "output": "Output:",
@@ -53,6 +76,12 @@
     "cached": "cached"
   },
   "toast": {
-    "failedLoad": "Failed to load traces"
+    "failedLoad": "Failed to load traces",
+    "abortStopped": "Run stopped",
+    "abortForced": "Run force-stopped (still cleaning up in background)",
+    "abortAlreadyAborting": "Stop already in progress",
+    "abortNotFound": "Run already finished",
+    "abortUnauthorized": "Not authorized to stop this run",
+    "abortFailed": "Failed to stop run"
   }
 }

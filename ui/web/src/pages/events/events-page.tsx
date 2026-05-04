@@ -50,7 +50,7 @@ export function EventsPage() {
         }
         setTeamMap(map);
       })
-      .catch(() => {});
+      .catch((err) => console.error("[EventsPage] fetch teams failed:", err));
   }, [ws, ws.isConnected]);
 
   const resolveTeam = useCallback(
@@ -58,7 +58,7 @@ export function EventsPage() {
       if (!teamId) return t("global");
       return teamMap.get(teamId) ?? teamId.slice(0, 8);
     },
-    [teamMap],
+    [teamMap, t],
   );
 
   // Unique teams from events for filter dropdown
@@ -118,7 +118,7 @@ export function EventsPage() {
           e.event.startsWith("team.member."),
       );
     }
-    return userFilteredEvents.filter((e) => e.event.startsWith(categoryFilter));
+    return chatFilteredEvents.filter((e) => e.event.startsWith(categoryFilter));
   }, [chatFilteredEvents, categoryFilter]);
 
   // Auto-scroll to bottom when new events arrive
@@ -142,7 +142,7 @@ export function EventsPage() {
   }, []);
 
   return (
-    <div className="p-4 sm:p-6">
+    <div className="p-4 sm:p-6 pb-10">
       <PageHeader
         title={t("title")}
         description={t("description")}
@@ -200,7 +200,7 @@ export function EventsPage() {
           <select
             value={teamFilter}
             onChange={(e) => setTeamFilter(e.target.value)}
-            className="h-7 rounded-md border bg-background px-2 text-xs"
+            className="h-7 rounded-md border bg-background px-2 text-base md:text-xs"
           >
             <option value="all">{t("filters.allTeams")}</option>
             {uniqueTeams.map((id) => (
@@ -215,7 +215,7 @@ export function EventsPage() {
         <select
           value={userFilter}
           onChange={(e) => setUserFilter(e.target.value)}
-          className="h-7 rounded-md border bg-background px-2 text-xs"
+          className="h-7 rounded-md border bg-background px-2 text-base md:text-xs"
         >
           <option value="all">{t("filters.allUsers")}</option>
           {uniqueUsers.map((uid) => (
@@ -229,7 +229,7 @@ export function EventsPage() {
         <select
           value={chatFilter}
           onChange={(e) => setChatFilter(e.target.value)}
-          className="h-7 rounded-md border bg-background px-2 text-xs"
+          className="h-7 rounded-md border bg-background px-2 text-base md:text-xs"
         >
           <option value="all">{t("filters.allChats")}</option>
           {uniqueChats.map((cid) => (

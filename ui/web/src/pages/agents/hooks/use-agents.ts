@@ -6,6 +6,7 @@ import { Methods } from "@/api/protocol";
 import { queryKeys } from "@/lib/query-keys";
 import { toast } from "@/stores/use-toast-store";
 import i18n from "@/i18n";
+import { userFriendlyError } from "@/lib/error-utils";
 import type { AgentData } from "@/types/agent";
 
 interface AgentInfoWs {
@@ -46,11 +47,12 @@ export function useAgents() {
         max_tool_iterations: 0,
         workspace: "",
         restrict_to_workspace: false,
-        agent_type: "open" as const,
+        agent_type: (a as unknown as { agentType?: string }).agentType === "predefined" ? "predefined" as const : "open" as const,
         is_default: false,
-        status: a.isRunning ? "running" : "idle",
+        status: a.isRunning ? "active" : "inactive",
       }));
     },
+    staleTime: 60_000,
     enabled: connected,
   });
 
@@ -69,7 +71,7 @@ export function useAgents() {
         toast.success(i18n.t("agents:toast.created"), `${data.display_name || data.agent_key || "Agent"} has been added`);
         return res;
       } catch (err) {
-        toast.error(i18n.t("agents:toast.createFailed"), err instanceof Error ? err.message : i18n.t("agents:toast.unknownError"));
+        toast.error(i18n.t("agents:toast.createFailed"), userFriendlyError(err));
         throw err;
       }
     },
@@ -83,7 +85,7 @@ export function useAgents() {
         await invalidate();
         toast.success(i18n.t("agents:toast.updated"), `${data.display_name || data.agent_key || "Agent"} has been updated`);
       } catch (err) {
-        toast.error(i18n.t("agents:toast.updateFailed"), err instanceof Error ? err.message : i18n.t("agents:toast.unknownError"));
+        toast.error(i18n.t("agents:toast.updateFailed"), userFriendlyError(err));
         throw err;
       }
     },
@@ -97,7 +99,7 @@ export function useAgents() {
         await invalidate();
         toast.success(i18n.t("agents:toast.deleted"));
       } catch (err) {
-        toast.error(i18n.t("agents:toast.deleteFailed"), err instanceof Error ? err.message : i18n.t("agents:toast.unknownError"));
+        toast.error(i18n.t("agents:toast.deleteFailed"), userFriendlyError(err));
         throw err;
       }
     },
@@ -111,5 +113,12 @@ export function useAgents() {
     [http],
   );
 
-  return { agents, loading, error, refresh: invalidate, createAgent, updateAgent, deleteAgent, resummonAgent };
+  const cancelSummonAgent = useCallback(
+    async (id: string) => {
+      await http.post(`/v1/agents/${id}/cancel-summon`);
+    },
+    [http],
+  );
+
+  return { agents, loading, error, refresh: invalidate, createAgent, updateAgent, deleteAgent, resummonAgent, cancelSummonAgent };
 }

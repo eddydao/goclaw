@@ -3,6 +3,9 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useHttp } from "@/hooks/use-ws";
 import { queryKeys } from "@/lib/query-keys";
 import type { SkillWithGrant } from "@/types/skill";
+import { toast } from "@/stores/use-toast-store";
+import i18next from "i18next";
+import { userFriendlyError } from "@/lib/error-utils";
 
 export function useAgentSkills(agentId: string) {
   const http = useHttp();
@@ -15,6 +18,7 @@ export function useAgentSkills(agentId: string) {
       http
         .get<{ skills: SkillWithGrant[] }>(`/v1/agents/${agentId}/skills`)
         .then((r) => r.skills ?? []),
+    staleTime: 60_000,
   });
 
   const optimisticToggle = useCallback(
@@ -36,6 +40,10 @@ export function useAgentSkills(agentId: string) {
       optimisticToggle(skillId, true);
       try {
         await http.post(`/v1/skills/${skillId}/grants/agent`, { agent_id: agentId });
+        toast.success(i18next.t("agents:toast.skillGranted"));
+      } catch (err) {
+        toast.error(i18next.t("agents:toast.skillGrantFailed"), userFriendlyError(err));
+        throw err;
       } finally {
         await invalidate();
       }
@@ -48,6 +56,10 @@ export function useAgentSkills(agentId: string) {
       optimisticToggle(skillId, false);
       try {
         await http.delete(`/v1/skills/${skillId}/grants/agent/${agentId}`);
+        toast.success(i18next.t("agents:toast.skillRevoked"));
+      } catch (err) {
+        toast.error(i18next.t("agents:toast.skillRevokeFailed"), userFriendlyError(err));
+        throw err;
       } finally {
         await invalidate();
       }

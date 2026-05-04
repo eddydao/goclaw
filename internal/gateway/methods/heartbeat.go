@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
@@ -19,10 +21,12 @@ import (
 
 // HeartbeatMethods handles heartbeat.get/set/toggle/test/logs/checklist RPC methods.
 type HeartbeatMethods struct {
-	hbStore    store.HeartbeatStore
-	agentStore store.AgentStore
-	eventBus   bus.EventPublisher
-	wakeFn     func(uuid.UUID) // triggers immediate heartbeat run
+	hbStore       store.HeartbeatStore
+	agentStore    store.AgentStore
+	agentRouter   *agent.Router // cache-aware lookup for resolveAgentUUIDCached hot path
+	providerStore store.ProviderStore
+	eventBus      bus.EventPublisher
+	wakeFn        func(uuid.UUID) // triggers immediate heartbeat run
 }
 
 func NewHeartbeatMethods(hb store.HeartbeatStore, eventBus bus.EventPublisher) *HeartbeatMethods {
@@ -32,6 +36,17 @@ func NewHeartbeatMethods(hb store.HeartbeatStore, eventBus bus.EventPublisher) *
 // SetAgentStore sets the agent store for HEARTBEAT.md read/write via RPC.
 func (m *HeartbeatMethods) SetAgentStore(as store.AgentStore) {
 	m.agentStore = as
+}
+
+// SetAgentRouter wires the agent router for cache-aware agent_key resolution.
+// Optional — when nil, resolveAgentUUIDCached falls back to a pure DB lookup.
+func (m *HeartbeatMethods) SetAgentRouter(r *agent.Router) {
+	m.agentRouter = r
+}
+
+// SetProviderStore sets the provider store for resolving provider names to UUIDs.
+func (m *HeartbeatMethods) SetProviderStore(ps store.ProviderStore) {
+	m.providerStore = ps
 }
 
 // SetWakeFn sets the function called when "heartbeat.test" triggers an immediate run.
@@ -63,7 +78,7 @@ func (m *HeartbeatMethods) handleGet(ctx context.Context, client *gateway.Client
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
+	agentUUID, err := resolveAgentUUIDCached(ctx, m.agentRouter, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
 		return
@@ -89,6 +104,7 @@ func (m *HeartbeatMethods) handleSet(ctx context.Context, client *gateway.Client
 		Enabled         *bool   `json:"enabled"`
 		IntervalSec     *int    `json:"intervalSec"`
 		Prompt          *string `json:"prompt"`
+		ProviderName    *string `json:"providerName"`
 		Model           *string `json:"model"`
 		IsolatedSession *bool   `json:"isolatedSession"`
 		LightContext    *bool   `json:"lightContext"`
@@ -108,7 +124,7 @@ func (m *HeartbeatMethods) handleSet(ctx context.Context, client *gateway.Client
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
+	agentUUID, err := resolveAgentUUIDCached(ctx, m.agentRouter, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
 		return
@@ -143,8 +159,24 @@ func (m *HeartbeatMethods) handleSet(ctx context.Context, client *gateway.Client
 	if params.Prompt != nil {
 		hb.Prompt = params.Prompt
 	}
+	if params.ProviderName != nil {
+		if *params.ProviderName == "" {
+			hb.ProviderID = nil // clear override
+		} else if m.providerStore != nil {
+			prov, err := m.providerStore.GetProviderByName(ctx, *params.ProviderName)
+			if err != nil {
+				client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "provider not found: "+*params.ProviderName))
+				return
+			}
+			hb.ProviderID = &prov.ID
+		}
+	}
 	if params.Model != nil {
-		hb.Model = params.Model
+		if *params.Model == "" {
+			hb.Model = nil // clear override
+		} else {
+			hb.Model = params.Model
+		}
 	}
 	if params.IsolatedSession != nil {
 		hb.IsolatedSession = *params.IsolatedSession
@@ -173,6 +205,13 @@ func (m *HeartbeatMethods) handleSet(ctx context.Context, client *gateway.Client
 		hb.ActiveHoursEnd = params.ActiveHoursEnd
 	}
 	if params.Timezone != nil {
+		if *params.Timezone != "" {
+			if _, err := time.LoadLocation(*params.Timezone); err != nil {
+				client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest,
+					fmt.Sprintf("invalid timezone: %s", *params.Timezone)))
+				return
+			}
+		}
 		hb.Timezone = params.Timezone
 	}
 	if params.Channel != nil {
@@ -211,7 +250,7 @@ func (m *HeartbeatMethods) handleToggle(ctx context.Context, client *gateway.Cli
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
+	agentUUID, err := resolveAgentUUIDCached(ctx, m.agentRouter, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
 		return
@@ -259,7 +298,7 @@ func (m *HeartbeatMethods) handleTest(ctx context.Context, client *gateway.Clien
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
+	agentUUID, err := resolveAgentUUIDCached(ctx, m.agentRouter, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
 		return
@@ -294,7 +333,7 @@ func (m *HeartbeatMethods) handleLogs(ctx context.Context, client *gateway.Clien
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
+	agentUUID, err := resolveAgentUUIDCached(ctx, m.agentRouter, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
 		return
@@ -329,7 +368,7 @@ func (m *HeartbeatMethods) handleChecklistGet(ctx context.Context, client *gatew
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
+	agentUUID, err := resolveAgentUUIDCached(ctx, m.agentRouter, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
 		return
@@ -372,7 +411,7 @@ func (m *HeartbeatMethods) handleChecklistSet(ctx context.Context, client *gatew
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
+	agentUUID, err := resolveAgentUUIDCached(ctx, m.agentRouter, m.agentStore, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
 		return
@@ -403,13 +442,13 @@ func (m *HeartbeatMethods) handleTargets(ctx context.Context, client *gateway.Cl
 		return
 	}
 
-	agentUUID, err := uuid.Parse(params.AgentID)
-	if err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInvalidRequest, "invalid agentId"))
-		return
+	// agentId param kept for backward compat but not used — targets are tenant-scoped.
+	tenantID := store.TenantIDFromContext(ctx)
+	if tenantID == uuid.Nil {
+		tenantID = store.MasterTenantID
 	}
 
-	targets, err := m.hbStore.ListDeliveryTargets(ctx, agentUUID)
+	targets, err := m.hbStore.ListDeliveryTargets(ctx, tenantID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, heartbeatInternalErr("targets", err)))
 		return

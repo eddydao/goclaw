@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"strconv"
 )
 
@@ -28,6 +29,42 @@ func (c *LarkClient) SendMessage(ctx context.Context, receiveIDType, receiveID, 
 	}
 	if resp.Code != 0 {
 		return nil, fmt.Errorf("send message: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	var data SendMessageResp
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return nil, fmt.Errorf("unmarshal response: %w", err)
+	}
+	return &data, nil
+}
+
+// ReplyMessage posts a reply to an existing Lark message via
+// POST /open-apis/im/v1/messages/{message_id}/reply.
+//
+// When replyInThread is true and the target message is inside a thread,
+// the reply stays nested in that thread. When the target is not threaded,
+// the reply renders as an inline quote at chat level.
+//
+// NOTE: `content` must be a double-encoded JSON string (e.g. `{"text":"hi"}`),
+// not a Go struct. The Lark API rejects object-typed `content`.
+func (c *LarkClient) ReplyMessage(ctx context.Context, rootMessageID, msgType, content string, replyInThread bool) (*SendMessageResp, error) {
+	if rootMessageID == "" {
+		return nil, fmt.Errorf("reply message: empty root message id")
+	}
+	// Defensive escaping: Lark message IDs are currently `om_` + alphanumeric,
+	// but any future schema change that permits `/` or reserved chars would
+	// otherwise silently break URL routing.
+	path := fmt.Sprintf("/open-apis/im/v1/messages/%s/reply", url.PathEscape(rootMessageID))
+	body := map[string]any{
+		"msg_type":        msgType,
+		"content":         content,
+		"reply_in_thread": replyInThread,
+	}
+	resp, err := c.doJSON(ctx, "POST", path, body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("reply message: code=%d msg=%s", resp.Code, resp.Msg)
 	}
 	var data SendMessageResp
 	if err := json.Unmarshal(resp.Data, &data); err != nil {
@@ -87,6 +124,42 @@ func (c *LarkClient) UploadFile(ctx context.Context, data io.Reader, fileName, f
 		return "", fmt.Errorf("unmarshal response: %w", err)
 	}
 	return result.FileKey, nil
+}
+
+// --- IM API: Get Message ---
+
+// GetMessageResp holds the response from GET /open-apis/im/v1/messages/{message_id}.
+type GetMessageResp struct {
+	Items []struct {
+		MessageID   string `json:"message_id"`
+		MsgType     string `json:"msg_type"`
+		Body        struct {
+			Content string `json:"content"`
+		} `json:"body"`
+		Sender struct {
+			ID         string `json:"id"`
+			IDType     string `json:"id_type"`
+			SenderType string `json:"sender_type"`
+		} `json:"sender"`
+	} `json:"items"`
+}
+
+// GetMessage retrieves a message by ID.
+// Lark API: GET /open-apis/im/v1/messages/{message_id}
+func (c *LarkClient) GetMessage(ctx context.Context, messageID string) (*GetMessageResp, error) {
+	path := fmt.Sprintf("/open-apis/im/v1/messages/%s", messageID)
+	resp, err := c.doJSON(ctx, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Code != 0 {
+		return nil, fmt.Errorf("get message: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	var data GetMessageResp
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return nil, fmt.Errorf("unmarshal get message: %w", err)
+	}
+	return &data, nil
 }
 
 // --- IM API: Message Resources ---
@@ -214,6 +287,57 @@ func (c *LarkClient) GetBotInfo(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("unmarshal response: %w", err)
 	}
 	return result.Bot.OpenID, nil
+}
+
+// --- IM API: Chat Members ---
+
+// ChatMember represents a member of a Lark group chat.
+type ChatMember struct {
+	MemberID     string `json:"member_id"`
+	MemberIDType string `json:"member_id_type"`
+	Name         string `json:"name"`
+	TenantKey    string `json:"tenant_key"`
+}
+
+// ListChatMembers returns all members of a group chat, handling pagination automatically.
+// Lark API: GET /open-apis/im/v1/chats/{chat_id}/members
+// Requires scope: im:chat.members:read
+func (c *LarkClient) ListChatMembers(ctx context.Context, chatID string) ([]ChatMember, error) {
+	var all []ChatMember
+	pageToken := ""
+
+	for {
+		path := fmt.Sprintf("/open-apis/im/v1/chats/%s/members?member_id_type=open_id&page_size=100", url.PathEscape(chatID))
+		if pageToken != "" {
+			path += "&page_token=" + url.QueryEscape(pageToken)
+		}
+
+		resp, err := c.doJSON(ctx, "GET", path, nil)
+		if err != nil {
+			return nil, err
+		}
+		if resp.Code != 0 {
+			return nil, fmt.Errorf("list chat members: code=%d msg=%s", resp.Code, resp.Msg)
+		}
+
+		var result struct {
+			Items     []ChatMember `json:"items"`
+			PageToken string       `json:"page_token"`
+			HasMore   bool         `json:"has_more"`
+		}
+		if err := json.Unmarshal(resp.Data, &result); err != nil {
+			return nil, fmt.Errorf("unmarshal response: %w", err)
+		}
+
+		all = append(all, result.Items...)
+
+		if !result.HasMore || result.PageToken == "" {
+			break
+		}
+		pageToken = result.PageToken
+	}
+
+	return all, nil
 }
 
 // --- Contact API ---

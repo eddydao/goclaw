@@ -13,6 +13,7 @@ import {
 import { useProviders } from "@/pages/providers/hooks/use-providers";
 import { useProviderModels } from "@/pages/providers/hooks/use-provider-models";
 import { useProviderVerify } from "@/pages/providers/hooks/use-provider-verify";
+import { getChatGPTOAuthPoolOwnership } from "@/pages/providers/provider-utils";
 import { InfoLabel } from "./info-label";
 
 interface ProviderModelSelectProps {
@@ -36,6 +37,12 @@ interface ProviderModelSelectProps {
   onSaveBlockedChange?: (blocked: boolean) => void;
   /** When true, skip auto-selecting the first provider when none is set. Useful when empty means "use default". */
   allowEmpty?: boolean;
+  /** When true, only show providers with settings.embedding.enabled. */
+  filterEmbedding?: boolean;
+  /** Filter model list by keyword (case-insensitive). E.g. "embed" to show only embedding models. */
+  modelFilter?: string;
+  /** Extra models to prepend to the dropdown (e.g. curated embedding models not returned by API). */
+  extraModels?: { id: string; name: string }[];
 }
 
 export function ProviderModelSelect({
@@ -54,12 +61,27 @@ export function ProviderModelSelect({
   savedModel,
   onSaveBlockedChange,
   allowEmpty,
+  filterEmbedding,
+  modelFilter,
+  extraModels,
 }: ProviderModelSelectProps) {
   const { t } = useTranslation("common");
   const { providers } = useProviders();
+  const poolOwnership = useMemo(() => getChatGPTOAuthPoolOwnership(providers), [providers]);
+
   const enabledProviders = useMemo(
-    () => providers.filter((p) => p.enabled),
-    [providers],
+    () => providers.filter((p) => {
+      if (!p.enabled) return false;
+      // Hide pool members — pool routing is handled via the owner provider
+      if (poolOwnership.ownerByMember.has(p.name)) return false;
+      if (filterEmbedding) {
+        const s = p.settings as Record<string, unknown> | undefined;
+        const emb = s?.embedding as { enabled?: boolean } | undefined;
+        return emb?.enabled === true;
+      }
+      return true;
+    }),
+    [providers, poolOwnership, filterEmbedding],
   );
 
   // Stable ref for callback — prevents the auto-select effect from re-running
@@ -80,7 +102,7 @@ export function ProviderModelSelect({
     [enabledProviders, provider],
   );
   const selectedProviderId = selectedProvider?.id;
-  const { models, loading: modelsLoading } = useProviderModels(selectedProviderId, selectedProvider?.provider_type);
+  const { models, loading: modelsLoading } = useProviderModels(selectedProviderId);
   const { verify, verifying, result: verifyResult, reset: resetVerify } = useProviderVerify();
 
   const hasSavedValues = savedProvider !== undefined && savedModel !== undefined;
@@ -126,7 +148,14 @@ export function ProviderModelSelect({
               )}
               {enabledProviders.map((p) => (
                 <SelectItem key={p.name} value={p.name}>
-                  {p.display_name || p.name}
+                  <span className="flex items-center gap-2">
+                    {p.display_name || p.name}
+                    {poolOwnership.membersByOwner.has(p.name) && (
+                      <span className="rounded border border-primary/30 bg-primary/10 px-1.5 py-px text-2xs font-medium text-primary">
+                        {t("providers:list.poolBadge")}
+                      </span>
+                    )}
+                  </span>
                 </SelectItem>
               ))}
             </SelectContent>
@@ -146,8 +175,26 @@ export function ProviderModelSelect({
             <Combobox
               value={model}
               onChange={onModelChange}
-              options={models.map((m) => ({ value: m.id, label: m.name }))}
+              options={(() => {
+                let list = modelFilter
+                  ? models.filter((m) => {
+                      const id = m.id.toLowerCase();
+                      const name = (m.name ?? "").toLowerCase();
+                      const f = modelFilter.toLowerCase();
+                      return id.includes(f) || name.includes(f);
+                    })
+                  : models;
+                // Prepend extra models, dedup by id
+                if (extraModels?.length) {
+                  const apiIds = new Set(list.map((m) => m.id));
+                  const extras = extraModels.filter((m) => !apiIds.has(m.id));
+                  list = [...extras, ...list];
+                }
+                return list.map((m) => ({ value: m.id, label: m.name }));
+              })()}
               placeholder={modelsLoading ? t("loadingModels") : (modelPlaceholder ?? t("enterOrSelectModel"))}
+              allowCustom
+              customLabel={t("useCustomModel")}
             />
           </div>
           {shouldShowVerify && (

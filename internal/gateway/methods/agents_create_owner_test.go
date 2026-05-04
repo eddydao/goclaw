@@ -31,6 +31,15 @@ func (s *createCaptureStore) GetByKey(_ context.Context, _ string) (*store.Agent
 func (s *createCaptureStore) GetByID(_ context.Context, _ uuid.UUID) (*store.AgentData, error) {
 	return nil, nil
 }
+func (s *createCaptureStore) GetByIDUnscoped(_ context.Context, _ uuid.UUID) (*store.AgentData, error) {
+	return nil, nil
+}
+func (s *createCaptureStore) GetByKeys(_ context.Context, _ []string) ([]store.AgentData, error) {
+	return nil, nil
+}
+func (s *createCaptureStore) GetByIDs(_ context.Context, _ []uuid.UUID) ([]store.AgentData, error) {
+	return nil, nil
+}
 func (s *createCaptureStore) Update(_ context.Context, _ uuid.UUID, _ map[string]any) error {
 	return nil
 }
@@ -40,6 +49,9 @@ func (s *createCaptureStore) List(_ context.Context, _ string) ([]store.AgentDat
 }
 func (s *createCaptureStore) GetDefault(_ context.Context) (*store.AgentData, error) {
 	return nil, nil
+}
+func (s *createCaptureStore) ResetStuckSummoning(_ context.Context) (int64, error) {
+	return 0, nil
 }
 func (s *createCaptureStore) ShareAgent(_ context.Context, _ uuid.UUID, _, _, _ string) error {
 	return nil
@@ -68,7 +80,13 @@ func (s *createCaptureStore) GetUserContextFiles(_ context.Context, _ uuid.UUID,
 func (s *createCaptureStore) SetUserContextFile(_ context.Context, _ uuid.UUID, _, _, _ string) error {
 	return nil
 }
+func (s *createCaptureStore) ListUserContextFilesByName(_ context.Context, _ uuid.UUID, _ string) ([]store.UserContextFileData, error) {
+	return nil, nil
+}
 func (s *createCaptureStore) DeleteUserContextFile(_ context.Context, _ uuid.UUID, _, _ string) error {
+	return nil
+}
+func (s *createCaptureStore) MigrateUserDataOnMerge(_ context.Context, _ []string, _ string) error {
 	return nil
 }
 func (s *createCaptureStore) GetUserOverride(_ context.Context, _ uuid.UUID, _ string) (*store.UserAgentOverrideData, error) {
@@ -80,21 +98,6 @@ func (s *createCaptureStore) SetUserOverride(_ context.Context, _ *store.UserAge
 func (s *createCaptureStore) GetOrCreateUserProfile(_ context.Context, _ uuid.UUID, _, _, _ string) (bool, string, error) {
 	return false, "", nil
 }
-func (s *createCaptureStore) IsGroupFileWriter(_ context.Context, _ uuid.UUID, _, _ string) (bool, error) {
-	return false, nil
-}
-func (s *createCaptureStore) AddGroupFileWriter(_ context.Context, _ uuid.UUID, _, _, _, _ string) error {
-	return nil
-}
-func (s *createCaptureStore) RemoveGroupFileWriter(_ context.Context, _ uuid.UUID, _, _ string) error {
-	return nil
-}
-func (s *createCaptureStore) ListGroupFileWriters(_ context.Context, _ uuid.UUID, _ string) ([]store.GroupFileWriterData, error) {
-	return nil, nil
-}
-func (s *createCaptureStore) ListGroupFileWriterGroups(_ context.Context, _ uuid.UUID) ([]store.GroupWriterGroupInfo, error) {
-	return nil, nil
-}
 func (s *createCaptureStore) ListUserInstances(_ context.Context, _ uuid.UUID) ([]store.UserInstanceData, error) {
 	return nil, nil
 }
@@ -104,7 +107,9 @@ func (s *createCaptureStore) UpdateUserProfileMetadata(_ context.Context, _ uuid
 func (s *createCaptureStore) EnsureUserProfile(_ context.Context, _ uuid.UUID, _ string) error {
 	return nil
 }
-
+func (s *createCaptureStore) PropagateContextFile(_ context.Context, _ uuid.UUID, _ string) (int, error) {
+	return 0, nil
+}
 // ---- helpers ----
 
 // minimalConfig returns a config sufficient for handleCreate (provider + model defaults only).

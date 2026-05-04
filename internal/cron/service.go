@@ -58,21 +58,38 @@ func (cs *Service) Start() error {
 		cs.store = Store{Version: 1}
 	}
 
-	// Compute next runs for all enabled jobs
+	// Compute next runs for all enabled jobs: fix NULL and past-due next_run_at.
+	// Past-due jobs happen when the service was stopped and their scheduled time passed.
+	// Without this, ALL past-due jobs would fire simultaneously on the first tick.
+	// NOTE: After prolonged downtime, all past-due "every" jobs with the same interval
+	// will synchronize (all get next_run_at = now + interval). This is inherent because
+	// the original schedule anchor is not persisted. After the first execution cycle,
+	// anchor-based scheduling in executeJobByID preserves spacing going forward.
 	now := nowMS()
 	for i := range cs.store.Jobs {
 		job := &cs.store.Jobs[i]
-		if job.Enabled && job.State.NextRunAtMS == nil {
+		if job.Enabled && (job.State.NextRunAtMS == nil || *job.State.NextRunAtMS <= now) {
 			next := cs.computeNextRun(&job.Schedule, now)
 			job.State.NextRunAtMS = next
+			// Disable past-due one-time "at" jobs instead of leaving them as zombies
+			if next == nil && job.Schedule.Kind == "at" {
+				job.Enabled = false
+			}
 		}
 	}
-	cs.saveUnsafe()
+	if err := cs.saveUnsafe(); err != nil {
+		slog.Warn("cron: failed to persist store on start", "error", err)
+	}
 
 	cs.stopChan = make(chan struct{})
 	cs.running = true
 
-	go cs.runLoop(cs.stopChan)
+	// Snapshot the tick interval before spawning so the goroutine doesn't
+	// race with tests that mutate the package-level `runLoopTickInterval`
+	// after a previous Stop() returned but the runLoop goroutine hasn't yet
+	// executed its ticker construction.
+	tick := runLoopTickInterval
+	go cs.runLoop(cs.stopChan, tick)
 
 	slog.Info("cron service started", "jobs", len(cs.store.Jobs))
 	return nil
@@ -112,10 +129,10 @@ func (cs *Service) AddJob(name string, schedule Schedule, message string, delive
 		Payload: Payload{
 			Kind:    "agent_turn",
 			Message: message,
-			Deliver: deliver,
-			Channel: channel,
-			To:      to,
 		},
+		Deliver:        deliver,
+		DeliverChannel: channel,
+		DeliverTo:      to,
 		CreatedAtMS:    now,
 		UpdatedAtMS:    now,
 		DeleteAfterRun: schedule.Kind == "at",
@@ -125,7 +142,9 @@ func (cs *Service) AddJob(name string, schedule Schedule, message string, delive
 	job.State.NextRunAtMS = next
 
 	cs.store.Jobs = append(cs.store.Jobs, job)
-	cs.saveUnsafe()
+	if err := cs.saveUnsafe(); err != nil {
+		slog.Warn("cron: failed to persist after adding job", "id", job.ID, "error", err)
+	}
 
 	slog.Info("cron job added", "id", job.ID, "name", name, "kind", schedule.Kind)
 	return &job, nil
@@ -139,7 +158,9 @@ func (cs *Service) RemoveJob(jobID string) error {
 	for i, job := range cs.store.Jobs {
 		if job.ID == jobID {
 			cs.store.Jobs = append(cs.store.Jobs[:i], cs.store.Jobs[i+1:]...)
-			cs.saveUnsafe()
+			if err := cs.saveUnsafe(); err != nil {
+				slog.Warn("cron: failed to persist after removing job", "id", jobID, "error", err)
+			}
 			slog.Info("cron job removed", "id", jobID)
 			return nil
 		}
@@ -162,7 +183,9 @@ func (cs *Service) EnableJob(jobID string, enabled bool) error {
 			} else {
 				cs.store.Jobs[i].State.NextRunAtMS = nil
 			}
-			cs.saveUnsafe()
+			if err := cs.saveUnsafe(); err != nil {
+				slog.Warn("cron: failed to persist after toggling job", "id", jobID, "error", err)
+			}
 			slog.Info("cron job toggled", "id", jobID, "enabled", enabled)
 			return nil
 		}
@@ -228,13 +251,19 @@ func (cs *Service) UpdateJob(jobID string, patch JobPatch) (*Job, error) {
 			job.Payload.Message = patch.Message
 		}
 		if patch.Deliver != nil {
-			job.Payload.Deliver = *patch.Deliver
+			job.Deliver = *patch.Deliver
 		}
-		if patch.Channel != nil {
-			job.Payload.Channel = *patch.Channel
+		if patch.DeliverChannel != nil {
+			job.DeliverChannel = *patch.DeliverChannel
 		}
-		if patch.To != nil {
-			job.Payload.To = *patch.To
+		if patch.DeliverTo != nil {
+			job.DeliverTo = *patch.DeliverTo
+		}
+		if patch.WakeHeartbeat != nil {
+			job.WakeHeartbeat = *patch.WakeHeartbeat
+		}
+		if patch.Stateless != nil {
+			job.Stateless = *patch.Stateless
 		}
 		if patch.DeleteAfterRun != nil {
 			job.DeleteAfterRun = *patch.DeleteAfterRun
@@ -250,7 +279,9 @@ func (cs *Service) UpdateJob(jobID string, patch JobPatch) (*Job, error) {
 			job.State.NextRunAtMS = nil
 		}
 
-		cs.saveUnsafe()
+		if err := cs.saveUnsafe(); err != nil {
+			slog.Warn("cron: failed to persist after updating job", "id", jobID, "error", err)
+		}
 		slog.Info("cron job updated", "id", jobID)
 		result := cs.store.Jobs[i] // copy
 		return &result, nil

@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 )
+
+// invalidFcIDChars matches characters not allowed in Responses API tool call IDs.
+var invalidFcIDChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
 // buildRequestBody converts internal ChatRequest to Responses API format.
 func (p *CodexProvider) buildRequestBody(req ChatRequest, stream bool) map[string]any {
@@ -107,12 +111,26 @@ func (p *CodexProvider) buildRequestBody(req ChatRequest, stream bool) map[strin
 	if len(req.Tools) > 0 {
 		var tools []map[string]any
 		for _, t := range req.Tools {
-			tools = append(tools, map[string]any{
-				"type":        "function",
-				"name":        t.Function.Name,
-				"description": t.Function.Description,
-				"parameters":  t.Function.Parameters,
-			})
+			if t.Type == "image_generation" {
+				// Pass native image_generation tool object as-is — Responses API first-class tool.
+				// Defaults chosen for Phase 1b; per-agent overrides are Phase 4.
+				tools = append(tools, map[string]any{
+					"type":           "image_generation",
+					"action":         "generate",
+					"model":          "gpt-image-2",
+					"output_format":  "png",
+					"partial_images": 1,
+				})
+			} else {
+				// Function tool path (default). Works with both value-type and pointer Function
+				// fields — we only access t.Function when type is not "image_generation".
+				tools = append(tools, map[string]any{
+					"type":        "function",
+					"name":        t.Function.Name,
+					"description": t.Function.Description,
+					"parameters":  NormalizeSchema("codex", t.Function.Parameters),
+				})
+			}
 		}
 		body["tools"] = tools
 	}
@@ -164,16 +182,17 @@ func (p *CodexProvider) doRequest(ctx context.Context, body any) (io.ReadCloser,
 	return resp.Body, nil
 }
 
-// toFcID ensures a tool call ID starts with "fc_" as required by the Responses API.
+// toFcID ensures a tool call ID starts with "fc_" and contains only
+// letters, numbers, underscores, or dashes as required by the Responses API.
 func toFcID(id string) string {
-	if strings.HasPrefix(id, "fc_") {
-		return id
-	}
 	if strings.HasPrefix(id, "tool_") {
-		return "fc_" + id[len("tool_"):]
+		id = id[len("tool_"):]
+	} else if strings.HasPrefix(id, "call_") {
+		id = id[len("call_"):]
+	} else if strings.HasPrefix(id, "fc_") {
+		id = id[len("fc_"):]
 	}
-	if strings.HasPrefix(id, "call_") {
-		return "fc_" + id[len("call_"):]
-	}
+	// Replace invalid characters (e.g. colons from session keys) with underscores.
+	id = invalidFcIDChars.ReplaceAllString(id, "_")
 	return "fc_" + id
 }

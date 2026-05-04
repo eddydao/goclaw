@@ -1,7 +1,6 @@
 package http
 
 import (
-	"encoding/json"
 	"log/slog"
 	"net/http"
 	"time"
@@ -19,13 +18,12 @@ import (
 // APIKeysHandler handles API key management endpoints.
 type APIKeysHandler struct {
 	apiKeys store.APIKeyStore
-	token   string          // gateway token for admin auth
 	msgBus  *bus.MessageBus // for cache invalidation events
 }
 
 // NewAPIKeysHandler creates a handler for API key management endpoints.
-func NewAPIKeysHandler(apiKeys store.APIKeyStore, token string, msgBus *bus.MessageBus) *APIKeysHandler {
-	return &APIKeysHandler{apiKeys: apiKeys, token: token, msgBus: msgBus}
+func NewAPIKeysHandler(apiKeys store.APIKeyStore, msgBus *bus.MessageBus) *APIKeysHandler {
+	return &APIKeysHandler{apiKeys: apiKeys, msgBus: msgBus}
 }
 
 // RegisterRoutes registers all API key management routes on the given mux.
@@ -37,15 +35,16 @@ func (h *APIKeysHandler) RegisterRoutes(mux *http.ServeMux) {
 
 // adminAuth ensures the caller has admin access (gateway token or API key with admin scope).
 func (h *APIKeysHandler) adminAuth(next http.HandlerFunc) http.HandlerFunc {
-	return requireAuth(h.token, permissions.RoleAdmin, next)
+	return requireAuth(permissions.RoleAdmin, next)
 }
 
 func (h *APIKeysHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
-	keys, err := h.apiKeys.List(r.Context())
+	// HTTP API key list is admin-only (adminAuth middleware), so no owner filter needed.
+	keys, err := h.apiKeys.List(r.Context(), "")
 	if err != nil {
 		slog.Error("api_keys.list failed", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgFailedToList, "API keys")})
+		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToList, "API keys"))
 		return
 	}
 	if keys == nil {
@@ -61,29 +60,29 @@ func (h *APIKeysHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Name      string   `json:"name"`
 		Scopes    []string `json:"scopes"`
 		ExpiresIn *int     `json:"expires_in"` // seconds; nil = never
+		TenantID  string   `json:"tenant_id"`  // optional UUID; cross-tenant callers may specify or omit (NULL = system key)
 	}
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &input) {
 		return
 	}
 
 	if input.Name == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "name")})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "name"))
 		return
 	}
 	if len(input.Name) > 100 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "name must be 100 characters or less")})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, "name must be 100 characters or less"))
 		return
 	}
 	if len(input.Scopes) == 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "scopes")})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgRequired, "scopes"))
 		return
 	}
 
 	// Validate scopes
 	for _, s := range input.Scopes {
 		if !permissions.ValidScope(s) {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidRequest, "invalid scope: "+s)})
+			writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidRequest, "invalid scope: "+s))
 			return
 		}
 	}
@@ -91,8 +90,24 @@ func (h *APIKeysHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	raw, hash, prefix, err := crypto.GenerateAPIKey()
 	if err != nil {
 		slog.Error("api_keys.generate failed", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgInternalError, "key generation")})
+		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgInternalError, "key generation"))
 		return
+	}
+
+	// Resolve tenant_id based on caller type.
+	var tenantID uuid.UUID // uuid.Nil = system-level (NULL in DB)
+	if store.IsOwnerRole(r.Context()) {
+		if input.TenantID != "" {
+			tid, err := uuid.Parse(input.TenantID)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "tenant_id"))
+				return
+			}
+			tenantID = tid
+		}
+		// else: uuid.Nil stays → system-level key
+	} else {
+		tenantID = store.TenantIDFromContext(r.Context())
 	}
 
 	now := time.Now()
@@ -102,6 +117,7 @@ func (h *APIKeysHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 		Prefix:    prefix,
 		KeyHash:   hash,
 		Scopes:    input.Scopes,
+		TenantID:  tenantID,
 		CreatedBy: extractUserID(r),
 		CreatedAt: now,
 		UpdatedAt: now,
@@ -114,7 +130,7 @@ func (h *APIKeysHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.apiKeys.Create(r.Context(), key); err != nil {
 		slog.Error("api_keys.create failed", "error", err)
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": i18n.T(locale, i18n.MsgFailedToCreate, "API key", "internal error")})
+		writeError(w, http.StatusInternalServerError, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToCreate, "API key", "internal error"))
 		return
 	}
 
@@ -132,18 +148,54 @@ func (h *APIKeysHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleRevoke revokes an API key after verifying the caller owns it.
+//
+// Phase 0b hotfix: the store layer's Revoke SQL matches rows where
+// `tenant_id = $N OR tenant_id IS NULL`, which let tenant admins revoke
+// system-level (NULL-tenant) API keys belonging to CI/CD or integrations.
+// The fix pre-fetches the key and rejects any non-owner caller whose tenant
+// does not exactly match the key's tenant. System owners bypass.
+// See plans/reports/debugger-260412-0922-tenant-scope-audit.md HIGH finding.
 func (h *APIKeysHandler) handleRevoke(w http.ResponseWriter, r *http.Request) {
 	locale := extractLocale(r)
 	idStr := r.PathValue("id")
 	id, err := uuid.Parse(idStr)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidID, "API key")})
+		writeError(w, http.StatusBadRequest, protocol.ErrInvalidRequest, i18n.T(locale, i18n.MsgInvalidID, "API key"))
 		return
 	}
 
-	if err := h.apiKeys.Revoke(r.Context(), id); err != nil {
+	ctx := r.Context()
+
+	// Fetch first so ownership can be verified before any mutation.
+	key, err := h.apiKeys.Get(ctx, id)
+	if err != nil || key == nil {
+		writeError(w, http.StatusNotFound, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "API key", idStr))
+		return
+	}
+
+	// Ownership rule:
+	//   - System owner (bypass-all)      → may revoke any key
+	//   - Tenant admin in caller's tenant → may revoke only keys owned by that tenant (strict match)
+	//   - NULL-tenant (system) keys       → revocable only by system owners
+	if !store.IsOwnerRole(ctx) {
+		callerTID := store.TenantIDFromContext(ctx)
+		if key.TenantID == uuid.Nil || key.TenantID != callerTID {
+			slog.Warn("security.api_key_revoke_forbidden",
+				"key_id", idStr,
+				"caller_tenant", callerTID,
+				"key_tenant", key.TenantID,
+				"user_id", store.UserIDFromContext(ctx),
+			)
+			writeError(w, http.StatusForbidden, protocol.ErrUnauthorized, i18n.T(locale, i18n.MsgPermissionDenied, "API key"))
+			return
+		}
+	}
+
+	// HTTP revoke is admin-only (adminAuth middleware), so no owner filter needed.
+	if err := h.apiKeys.Revoke(ctx, id, ""); err != nil {
 		slog.Error("api_keys.revoke failed", "error", err, "id", idStr)
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": i18n.T(locale, i18n.MsgNotFound, "API key", idStr)})
+		writeError(w, http.StatusNotFound, protocol.ErrNotFound, i18n.T(locale, i18n.MsgNotFound, "API key", idStr))
 		return
 	}
 

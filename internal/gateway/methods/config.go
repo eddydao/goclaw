@@ -21,18 +21,69 @@ type ConfigMethods struct {
 	cfg          *config.Config
 	cfgPath      string
 	secretsStore store.ConfigSecretsStore
-	eventBus     bus.EventPublisher // nil-safe; broadcasts config change events
+	syncFn       func(ctx context.Context, cfg *config.Config) // nil-safe; syncs non-secret settings to system_configs
+	eventBus     bus.EventPublisher       // nil-safe; broadcasts config change events
 }
 
 func NewConfigMethods(cfg *config.Config, cfgPath string, secretsStore store.ConfigSecretsStore, eventBus bus.EventPublisher) *ConfigMethods {
 	return &ConfigMethods{cfg: cfg, cfgPath: cfgPath, secretsStore: secretsStore, eventBus: eventBus}
 }
 
+// SetSystemConfigSync sets a callback to sync config to system_configs after save.
+// The callback receives the final resolved config (with secrets + env applied).
+func (m *ConfigMethods) SetSystemConfigSync(fn func(ctx context.Context, cfg *config.Config)) {
+	m.syncFn = fn
+}
+
 func (m *ConfigMethods) Register(router *gateway.MethodRouter) {
-	router.Register(protocol.MethodConfigGet, m.handleGet)
-	router.Register(protocol.MethodConfigApply, m.handleApply)
-	router.Register(protocol.MethodConfigPatch, m.handlePatch)
-	router.Register(protocol.MethodConfigSchema, m.handleSchema)
+	router.Register(protocol.MethodConfigGet, m.requireMasterScope(m.requireOwner(m.handleGet)))
+	router.Register(protocol.MethodConfigApply, m.requireMasterScope(m.requireOwner(m.handleApply)))
+	router.Register(protocol.MethodConfigPatch, m.requireMasterScope(m.requireOwner(m.handlePatch)))
+	router.Register(protocol.MethodConfigSchema, m.requireMasterScope(m.requireOwner(m.handleSchema)))
+	// config.defaults is read-only + secret-free (Go consts + agents.defaults overlay),
+	// so it only needs requireMasterScope — owner gating would spam auth errors for
+	// operators viewing agent detail pages.
+	router.Register(protocol.MethodConfigDefaults, m.requireMasterScope(m.handleDefaults))
+}
+
+// requireOwner wraps a handler to only allow owner-role users.
+func (m *ConfigMethods) requireOwner(next gateway.MethodHandler) gateway.MethodHandler {
+	return func(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+		if !client.IsOwner() {
+			locale := store.LocaleFromContext(ctx)
+			client.SendResponse(protocol.NewErrorResponse(
+				req.ID, protocol.ErrUnauthorized,
+				i18n.T(locale, i18n.MsgPermissionDenied, req.Method),
+			))
+			return
+		}
+		next(ctx, client, req)
+	}
+}
+
+// requireMasterScope rejects config.* calls when the caller's ctx is scoped to
+// a non-master tenant. System owner callers (bypass-all) are allowed through.
+//
+// Background: config.* mutates the master in-memory *config.Config and the
+// on-disk config.json. A non-master tenant admin calling config.patch would
+// corrupt master state + leak master config to other tenants. This guard keeps
+// config.* strictly master-scoped until a tenant-aware refactor lands.
+//
+// Shares the predicate with store.IsMasterScope so HTTP and WS layers can't
+// drift — same rule, one source of truth.
+func (m *ConfigMethods) requireMasterScope(next gateway.MethodHandler) gateway.MethodHandler {
+	return func(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
+		if !store.IsMasterScope(ctx) {
+			locale := store.LocaleFromContext(ctx)
+			client.SendResponse(protocol.NewErrorResponse(
+				req.ID,
+				protocol.ErrUnauthorized,
+				i18n.T(locale, i18n.MsgConfigMasterScopeOnly),
+			))
+			return
+		}
+		next(ctx, client, req)
+	}
 }
 
 func (m *ConfigMethods) handleGet(_ context.Context, client *gateway.Client, req *protocol.RequestFrame) {
@@ -91,6 +142,7 @@ func (m *ConfigMethods) handleApply(ctx context.Context, client *gateway.Client,
 		}
 	}
 	m.cfg.ApplyEnvOverrides()
+	m.syncToSystemConfigs(ctx)
 	m.broadcastChanged()
 	emitAudit(m.eventBus, client, "config.applied", "config", "gateway")
 
@@ -164,6 +216,7 @@ func (m *ConfigMethods) handlePatch(ctx context.Context, client *gateway.Client,
 		}
 	}
 	m.cfg.ApplyEnvOverrides()
+	m.syncToSystemConfigs(ctx)
 	m.broadcastChanged()
 	emitAudit(m.eventBus, client, "config.patched", "config", "gateway")
 
@@ -174,6 +227,13 @@ func (m *ConfigMethods) handlePatch(ctx context.Context, client *gateway.Client,
 		"hash":    m.cfg.Hash(),
 		"restart": false,
 	}))
+}
+
+// syncToSystemConfigs syncs the resolved config to system_configs table for the given tenant.
+func (m *ConfigMethods) syncToSystemConfigs(ctx context.Context) {
+	if m.syncFn != nil {
+		m.syncFn(ctx, m.cfg)
+	}
 }
 
 // broadcastChanged notifies subscribers that config has been updated.

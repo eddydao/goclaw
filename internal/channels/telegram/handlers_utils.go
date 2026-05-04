@@ -1,10 +1,45 @@
 package telegram
 
 import (
+	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/mymmrac/telego"
 )
+
+// buildSelfIdentityPrompt returns a short system-prompt snippet telling the LLM
+// which Telegram handle represents itself, so it does not confuse its own
+// @mention for a different bot — especially useful in multi-bot groups where
+// other bots' mentions remain in the content after stripBotMention.
+// Returns empty string when the bot username has not been resolved yet.
+func buildSelfIdentityPrompt(botUsername, displayName string) string {
+	if botUsername == "" {
+		return ""
+	}
+	if displayName != "" {
+		return fmt.Sprintf("You are @%s (%s) on this Telegram channel.", botUsername, displayName)
+	}
+	return fmt.Sprintf("You are @%s on this Telegram channel.", botUsername)
+}
+
+// stripBotMention removes @botUsername tokens from text (case-insensitive).
+// Applied after the mention gate passes so the LLM does not see its own Telegram handle
+// and mistake itself for another bot (e.g. persona "Tiểu Hổ" receiving "@viet_super_bot vẽ...").
+//
+// Boundary rules match valid Telegram mentions:
+//   - Leading: start-of-string OR a non-word char (whitespace/punct). Prevents false strips
+//     inside words like "contact@viet_super_bot.com".
+//   - Trailing: \b (word-boundary). Prevents matching "@bot" inside "@bot_2".
+//
+// The leading non-word char is preserved via capture group $1.
+func stripBotMention(text, botUsername string) string {
+	if botUsername == "" || text == "" {
+		return text
+	}
+	pattern := `(?i)(^|[^\w])@` + regexp.QuoteMeta(botUsername) + `\b`
+	return strings.TrimSpace(regexp.MustCompile(pattern).ReplaceAllString(text, "$1"))
+}
 
 // detectMention checks if a Telegram message mentions the bot.
 // Checks both msg.Text/Entities (text messages) and msg.Caption/CaptionEntities (photo/media messages).
@@ -56,6 +91,49 @@ func (c *Channel) detectMention(msg *telego.Message, botUsername string) bool {
 		}
 	}
 
+	return false
+}
+
+// hasOtherMention checks if the message mentions any user/bot other than ours.
+// Used by "yield" mention mode: if another entity is explicitly @mentioned, this bot yields.
+// Checks both "mention" entities (@username) and "bot_command" entities (/cmd@bot).
+func (c *Channel) hasOtherMention(msg *telego.Message, myUsername string) bool {
+	lowerMy := strings.ToLower(myUsername)
+
+	for _, pair := range []struct {
+		entities []telego.MessageEntity
+		text     string
+	}{
+		{msg.Entities, msg.Text},
+		{msg.CaptionEntities, msg.Caption},
+	} {
+		if pair.text == "" {
+			continue
+		}
+		for _, entity := range pair.entities {
+			if entity.Type == "mention" {
+				mentioned := pair.text[entity.Offset : entity.Offset+entity.Length]
+				mentionedLower := strings.ToLower(mentioned)
+				// Skip our own mention
+				if mentionedLower == "@"+lowerMy {
+					continue
+				}
+				// Any other @mention in the message → another bot/user was called
+				return true
+			}
+			if entity.Type == "bot_command" {
+				cmdText := pair.text[entity.Offset : entity.Offset+entity.Length]
+				cmdLower := strings.ToLower(cmdText)
+				// Commands addressed to another bot: /cmd@other_bot
+				if atIdx := strings.Index(cmdLower, "@"); atIdx > 0 {
+					target := cmdLower[atIdx+1:]
+					if target != lowerMy {
+						return true
+					}
+				}
+			}
+		}
+	}
 	return false
 }
 

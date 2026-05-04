@@ -11,6 +11,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/sessions"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
 // resolveAgentRoute determines which agent should handle a message
@@ -74,20 +75,32 @@ func extractSessionMetadata(msg bus.InboundMessage, peerKind string) map[string]
 		meta["display_name"] = v
 	}
 
-	if v := msg.Metadata["username"]; v != "" {
-		meta["username"] = v
+	if v := msg.Metadata[tools.MetaUsername]; v != "" {
+		meta[tools.MetaUsername] = v
 	}
 	if peerKind != "" {
 		meta["peer_kind"] = peerKind
 	}
-	if v := msg.Metadata["chat_title"]; v != "" {
-		meta["chat_title"] = v
+	if v := msg.Metadata[tools.MetaChatTitle]; v != "" {
+		meta[tools.MetaChatTitle] = v
 	}
 
 	if len(meta) == 0 {
 		return nil
 	}
 	return meta
+}
+
+// buildPancakeSessionLabel returns "Pancake:{senderName}:{pageName}" with non-empty parts only.
+func buildPancakeSessionLabel(senderName, pageName string) string {
+	label := "Pancake"
+	if senderName != "" {
+		label += ":" + senderName
+	}
+	if pageName != "" {
+		label += ":" + pageName
+	}
+	return label
 }
 
 // buildAnnounceOutMeta builds outbound metadata for announce messages so that
@@ -98,9 +111,9 @@ func buildAnnounceOutMeta(localKey string) map[string]string {
 	}
 	meta := map[string]string{"local_key": localKey}
 	if idx := strings.Index(localKey, ":topic:"); idx > 0 {
-		meta["message_thread_id"] = localKey[idx+7:]
+		meta[tools.MetaMessageThreadID] = localKey[idx+7:]
 	} else if idx := strings.Index(localKey, ":thread:"); idx > 0 {
-		meta["message_thread_id"] = localKey[idx+8:]
+		meta[tools.MetaMessageThreadID] = localKey[idx+8:]
 	}
 	return meta
 }
@@ -116,11 +129,6 @@ func mediaToMarkdown(media []agent.MediaResult, cfg *config.Config) string {
 		return ""
 	}
 
-	tokenQuery := ""
-	if cfg.Gateway.Token != "" {
-		tokenQuery = "?token=" + cfg.Gateway.Token
-	}
-
 	var parts []string
 	for _, mr := range media {
 		cleanPath := filepath.Clean(mr.Path)
@@ -129,7 +137,15 @@ func mediaToMarkdown(media []agent.MediaResult, cfg *config.Config) string {
 		if urlPath == "" {
 			continue
 		}
-		fileURL := "/v1/files/" + urlPath + tokenQuery
+		// Store clean path only — no auth tokens in persisted session messages.
+		// Frontend adds auth (Bearer header or ?ft= signed token) at render time.
+		// Guard: if path is already a /v1/ URL (e.g. from mutated media), don't double-prefix.
+		var fileURL string
+		if strings.HasPrefix(urlPath, "v1/files/") || strings.HasPrefix(urlPath, "v1/media/") {
+			fileURL = "/" + strings.SplitN(urlPath, "?", 2)[0] // strip any existing query params
+		} else {
+			fileURL = "/v1/files/" + urlPath
+		}
 		if strings.HasPrefix(mr.ContentType, "image/") {
 			parts = append(parts, fmt.Sprintf("![image](%s)", fileURL))
 		} else {
@@ -172,4 +188,20 @@ func resolveChannelType(channelMgr *channels.Manager, name string) string {
 		return ""
 	}
 	return channelMgr.ChannelTypeForName(name)
+}
+
+// resolveSenderName extracts the sender display name from channel metadata.
+// Checks "sender_name" (Feishu), "first_name" (Telegram), "push_name" (WhatsApp).
+// Sanitizes to prevent prompt injection via newlines/control chars.
+func resolveSenderName(msg bus.InboundMessage) string {
+	for _, key := range []string{"sender_name", "first_name", "push_name", "display_name"} {
+		if name := msg.Metadata[key]; name != "" {
+			clean := strings.NewReplacer("\n", " ", "\r", " ", "\t", " ").Replace(strings.TrimSpace(name))
+			if len([]rune(clean)) > 100 {
+				clean = string([]rune(clean)[:100])
+			}
+			return clean
+		}
+	}
+	return ""
 }

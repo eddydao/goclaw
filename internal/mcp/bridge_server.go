@@ -47,8 +47,7 @@ var BridgeToolNames = map[string]bool{
 	"sessions_history": true,
 	"sessions_send":    true,
 	// Team tools (context from X-Agent-ID/X-Channel/X-Chat-ID headers)
-	"team_tasks":   true,
-	"team_message": true,
+	"team_tasks": true,
 }
 
 // NewBridgeServer creates a StreamableHTTPServer that exposes GoClaw tools as MCP tools.
@@ -99,7 +98,15 @@ func makeToolHandler(reg *tools.Registry, toolName string, msgBus *bus.MessageBu
 	return func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
 		args := req.GetArguments()
 
-		result := reg.Execute(ctx, toolName, args)
+		// Pass routing context (channel, chatID, peerKind, sessionKey) so native
+		// tools can access local_key, session_key etc. for forum topic routing.
+		result := reg.ExecuteWithContext(ctx, toolName, args,
+			tools.ToolChannelFromCtx(ctx),
+			tools.ToolChatIDFromCtx(ctx),
+			tools.ToolPeerKindFromCtx(ctx),
+			tools.ToolSessionKeyFromCtx(ctx),
+			nil,
+		)
 
 		if result.IsError {
 			return mcpgo.NewToolResultError(result.ForLLM), nil

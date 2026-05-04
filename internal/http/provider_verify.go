@@ -3,6 +3,8 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"os/exec"
 	"path/filepath"
@@ -10,10 +12,19 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
+
+// HandleVerifyProviderForTest invokes the verify handler directly without auth
+// middleware. Integration tests must inject the desired tenant_id into the
+// request context before calling. Production code MUST go through RegisterRoutes
+// so the auth/locale/tenant pipeline runs first.
+func (h *ProvidersHandler) HandleVerifyProviderForTest(w http.ResponseWriter, r *http.Request) {
+	h.handleVerifyProvider(w, r)
+}
 
 // handleVerifyProvider tests a provider+model combination with a minimal LLM call.
 //
@@ -31,14 +42,17 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 	var req struct {
 		Model string `json:"model"`
 	}
+	// Empty body == ping mode (connectivity check only). Truncated/malformed
+	// JSON still returns 400. io.EOF on Decode unambiguously means no body;
+	// io.ErrUnexpectedEOF is what truncated JSON returns.
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
-		return
+		if !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+			return
+		}
+		// empty body — req.Model stays "" → pingMode below
 	}
-	if req.Model == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgRequired, "model")})
-		return
-	}
+	pingMode := req.Model == ""
 
 	// Look up provider record from DB to get the provider name
 	p, err := h.store.GetProvider(r.Context(), id)
@@ -49,6 +63,10 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 
 	// ACP: verify binary exists on the server (no LLM call needed)
 	if p.ProviderType == store.ProviderACP {
+		if pingMode {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+			return
+		}
 		binary := p.APIBase
 		if binary == "" {
 			binary = "claude"
@@ -68,6 +86,10 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 
 	// Claude CLI: validate model alias locally (no LLM call needed)
 	if p.ProviderType == "claude_cli" {
+		if pingMode {
+			writeJSON(w, http.StatusOK, map[string]any{"valid": true})
+			return
+		}
 		validModels := map[string]bool{"sonnet": true, "opus": true, "haiku": true}
 		if validModels[req.Model] {
 			writeJSON(w, http.StatusOK, map[string]any{"valid": true})
@@ -82,9 +104,16 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	provider, err := h.providerReg.Get(p.Name)
+	// Use provider's own TenantID (not request context) so cross-tenant admins
+	// can verify providers belonging to other tenants.
+	provider, err := h.providerReg.GetForTenant(p.TenantID, p.Name)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": "provider not registered: " + p.Name})
+		return
+	}
+
+	if pingMode {
+		writeJSON(w, http.StatusOK, map[string]any{"valid": true})
 		return
 	}
 
@@ -95,7 +124,7 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
 
 	_, err = provider.Chat(ctx, providers.ChatRequest{
@@ -104,14 +133,14 @@ func (h *ProvidersHandler) handleVerifyProvider(w http.ResponseWriter, r *http.R
 		},
 		Model: req.Model,
 		Options: map[string]any{
-			"max_tokens": 1,
+			// Use a small but safe value — reasoning models need headroom beyond 1 token.
+			"max_tokens": 50,
 		},
 	})
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"valid": false, "error": friendlyVerifyError(err)})
 		return
 	}
-
 	writeJSON(w, http.StatusOK, map[string]any{"valid": true})
 }
 
@@ -135,11 +164,14 @@ func (h *ProvidersHandler) handleClaudeCLIAuthStatus(w http.ResponseWriter, r *h
 		}
 	}
 
+	inDocker := config.InDocker()
+
 	status, err := providers.CheckClaudeAuthStatus(ctx, cliPath)
 	if err != nil {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"logged_in": false,
 			"error":     err.Error(),
+			"in_docker": inDocker,
 		})
 		return
 	}
@@ -148,6 +180,7 @@ func (h *ProvidersHandler) handleClaudeCLIAuthStatus(w http.ResponseWriter, r *h
 		"logged_in":         status.LoggedIn,
 		"email":             status.Email,
 		"subscription_type": status.SubscriptionType,
+		"in_docker":         inDocker,
 	})
 }
 
@@ -158,6 +191,8 @@ func isNonChatModel(model string) bool {
 		"veo-", "google/veo-",
 		"dall-e-", "imagen-", "google/imagen-",
 		"gemini-2.5-flash-image", "google/gemini-2.5-flash-image",
+		"grok-imagine", // xAI video generation (grok-imagine-video)
+		"grok-2-image", // xAI image generation
 	}
 	m := strings.ToLower(model)
 	for _, prefix := range nonChatPrefixes {
@@ -171,6 +206,14 @@ func isNonChatModel(model string) bool {
 // friendlyVerifyError extracts a human-readable message from provider errors.
 // Raw errors often contain JSON blobs like: `HTTP 400: minimax: {"type":"error","error":{"type":"bad_request_error","message":"unknown model ..."}}`
 func friendlyVerifyError(err error) string {
+	// Timeout / context cancellation → user-friendly message
+	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "context deadline exceeded") {
+		return "Verification timed out — the provider took too long to respond. Please try again."
+	}
+	if errors.Is(err, context.Canceled) {
+		return "Verification was cancelled. Please try again."
+	}
+
 	msg := err.Error()
 
 	// Try to extract "message" field from embedded JSON
@@ -193,14 +236,24 @@ func friendlyVerifyError(err error) string {
 		}
 	}
 
-	// Fallback: strip "HTTP NNN: provider: " prefix for cleaner display
-	if idx := strings.LastIndex(msg, ": "); idx >= 0 && idx < len(msg)-2 {
+	// Fallback: strip "HTTP NNN: provider: " prefix for cleaner display.
+	// Use the FIRST ": " after "HTTP NNN" to avoid splitting inside JSON values.
+	if idx := strings.Index(msg, ": "); idx >= 0 && idx < len(msg)-2 {
 		suffix := msg[idx+2:]
-		// If the remainder still looks like JSON, just say "invalid model"
+		// Skip one more ": " to strip "provider: " prefix (e.g. "xai: {...}")
+		if idx2 := strings.Index(suffix, ": "); idx2 >= 0 && idx2 < 30 {
+			suffix = suffix[idx2+2:]
+		}
+		// If the remainder looks like JSON, say "invalid model"
 		if strings.HasPrefix(suffix, "{") {
 			return "Model not recognized by provider"
 		}
-		return suffix
+		// Strip leaked JSON quotes/braces from partial extraction
+		suffix = strings.TrimRight(suffix, "{}[]")
+		suffix = strings.Trim(suffix, `"`)
+		if suffix != "" {
+			return suffix
+		}
 	}
 
 	return msg

@@ -10,7 +10,7 @@ func init() {
 		MsgInvalidRequest:   "无效请求：%s",
 		MsgInvalidJSON:      "无效的 JSON",
 		MsgUnauthorized:     "未授权",
-		MsgPermissionDenied: "权限不足：无法访问 %s",
+		MsgPermissionDenied: "权限不足：%s",
 		MsgInternalError:    "内部错误：%s",
 		MsgInvalidSlug:      "%s 必须是有效的 slug（小写字母、数字、连字符）",
 		MsgFailedToList:     "获取 %s 列表失败",
@@ -30,6 +30,14 @@ func init() {
 		MsgNoUserMessage:     "未找到用户消息",
 		MsgUserIDRequired:    "user_id 是必填项",
 		MsgMsgRequired:       "消息是必填项",
+
+		// Abort
+		MsgAbortStopped:         "已停止运行",
+		MsgAbortForced:          "已强制中止运行（超过 3 秒宽限期）",
+		MsgAbortAlreadyAborting: "正在中止中",
+		MsgAbortNotFound:        "运行未找到或已结束",
+		MsgAbortUnauthorized:    "无权中止此运行",
+		MsgAbortFailed:          "无法中止运行：%s",
 
 		// Channel instances
 		MsgInvalidChannelType: "Channel类型无效",
@@ -65,7 +73,12 @@ func init() {
 		MsgAlreadySummoning:      "Agent正在被召唤中",
 		MsgSummoningUnavailable:  "召唤功能不可用",
 		MsgNoDescription:         "Agent没有可供重新召唤的描述",
+		MsgSummonCancelled:       "已取消召唤",
+		MsgCannotCancel:          "Agent 未处于召唤状态",
 		MsgInvalidPath:           "路径无效",
+
+		// Tenant backup / restore
+		MsgRestoreNewModeRejectsTenantID: "mode=new 会创建新租户；请传 tenant_slug（而非 tenant_id）作为新租户的 slug",
 
 		// Scheduler
 		MsgQueueFull:    "Session队列已满",
@@ -81,23 +94,21 @@ func init() {
 		MsgNotImplemented: "%s 尚未实现",
 
 		// Agent links
-		MsgLinksNotConfigured:   "Agent链接未配置",
-		MsgInvalidDirection:     "方向必须是 outbound、inbound 或 bidirectional",
-		MsgSourceTargetSame:     "源和目标必须是不同的Agent",
-		MsgCannotDelegateOpen:   "无法委派给开放型Agent — 只有预定义Agent才能作为委派目标",
-		MsgNoUpdatesProvided:    "未提供更新内容",
-		MsgInvalidLinkStatus:    "状态必须是 active 或 disabled",
+		MsgLinksNotConfigured: "Agent链接未配置",
+		MsgInvalidDirection:   "方向必须是 outbound、inbound 或 bidirectional",
+		MsgSourceTargetSame:   "源和目标必须是不同的Agent",
+		MsgCannotDelegateOpen: "无法委派给开放型Agent — 只有预定义Agent才能作为委派目标",
+		MsgNoUpdatesProvided:  "未提供更新内容",
+		MsgInvalidLinkStatus:  "状态必须是 active 或 disabled",
 
 		// Teams
 		MsgTeamsNotConfigured:   "团队未配置",
 		MsgAgentIsTeamLead:      "该Agent已是团队负责人",
 		MsgCannotRemoveTeamLead: "无法移除团队负责人",
 
-		// Delegations
-		MsgDelegationsUnavailable: "委派功能不可用",
-
 		// Channels
 		MsgCannotDeleteDefaultInst: "无法删除默认Channel实例",
+		MsgCannotRemoveLastWriter:  "无法移除最后一个文件管理员",
 
 		// Skills
 		MsgSkillsUpdateNotSupported: "基于文件的Skill不支持 skills.update",
@@ -107,8 +118,10 @@ func init() {
 		MsgInvalidLogAction: "action 必须是 'start' 或 'stop'",
 
 		// Config
-		MsgRawConfigRequired: "raw 配置是必填项",
-		MsgRawPatchRequired:  "raw 补丁是必填项",
+		MsgRawConfigRequired:     "raw 配置是必填项",
+		MsgRawPatchRequired:      "raw 补丁是必填项",
+		MsgConfigMasterScopeOnly: "config.* 方法仅适用于主作用域；使用租户工具配置端点进行租户级覆盖",
+		MsgMasterScopeRequired:   "此操作需要主租户范围",
 
 		// Storage / File
 		MsgCannotDeleteSkillsDir: "无法删除Skill目录",
@@ -172,10 +185,46 @@ func init() {
 		MsgToolSkillManage:     "从对话经验中创建、修补或删除技能",
 		MsgToolPublishSkill:    "将技能目录注册到系统数据库中，使其可被发现和授权",
 		MsgToolTeamTasks:       "查看、创建、更新和完成团队任务板上的任务",
-		MsgToolTeamMessage:     "向代理团队中的队友发送直接消息或广播",
 
 		MsgSkillNudgePostscript: "此任务涉及多个步骤。要我将此过程保存为可重用技能吗？回复 **\"保存技能\"** 或 **\"跳过\"**。",
 		MsgSkillNudge70Pct:      "[System] 您已使用 70% 的迭代预算。请考虑本次会话中的模式是否值得保存为技能。",
 		MsgSkillNudge90Pct:      "[System] 您已使用 90% 的迭代预算。如果本次会话涉及可重用的模式，请考虑在完成前将其保存为技能。",
+
+		MsgInvalidRole: "无效角色：允许的值为 owner、admin、operator、member、viewer",
+
+		MsgContactIDsRequired:  "contact_ids 为必填项",
+		MsgMergeTargetRequired: "必须提供 tenant_user_id 或 create_user 其中之一",
+		MsgTenantUserNotFound:  "未找到租户用户",
+		MsgTenantMismatch:      "租户用户不属于此租户",
+		MsgTenantScopeRequired: "此操作需要指定租户范围",
+
+		// TTS / 声音
+		MsgTtsUnknownModel:       "未知的 tts 模型：%s",
+		MsgVoicesListFailed:      "获取声音列表失败：%s",
+		MsgTtsGeminiInvalidVoice: "无效的 Gemini 声音：%s",
+		MsgTtsGeminiSpeakerLimit: "Gemini TTS 最多支持 2 位发言人",
+		MsgTtsGeminiInvalidModel:  "无效的 Gemini TTS 模型：%s",
+		MsgTtsGeminiTextOnly:      "Gemini 拒绝生成音频。请尝试更简单的文本，不要翻译或添加评论。",
+		MsgTtsParamOutOfRange:     "TTS 参数 %q 的值 %v 超出范围 [%v, %v]",
+		MsgTtsParamUnknownKey:     "TTS 参数 %q 不受此提供商支持",
+		MsgTtsMiniMaxVoicesFailed: "获取 MiniMax 声音列表失败：%s",
+
+		// STT
+		MsgSTTAllProvidersFailed:     "所有 STT 提供商均失败",
+		MsgSTTLegacyConfigDeprecated: "旧版 STT 配置已弃用；请迁移至 builtin_tools[stt]",
+		MsgSTTWhatsappPrivacyWarning: "为 WhatsApp 启用 STT 将破坏发送至此 Agent 的语音消息的端对端加密。",
+		MsgVoiceMessageFallback:      "[语音消息]",
+
+		// Hooks
+		MsgHookInvalidMatcher:          "无效的匹配器正则表达式: %s",
+		MsgHookCommandDisabledStandard: "命令类型钩子仅在 Lite 版本可用",
+		MsgHookPromptRequiresMatcher:   "prompt 钩子必须指定 matcher 或 if_expr(成本失控保护)",
+		MsgHookCircuitBreakerTripped:   "钩子在多次失败后已自动禁用",
+		MsgHookBudgetExceeded:          "租户钩子令牌预算已耗尽",
+		MsgHookPerTurnCapReached:       "单轮钩子调用次数已达上限",
+		MsgHookBuiltinReadOnly:         "内置钩子只读,仅允许切换启用状态",
+
+		// Message tool cross-target forward notice
+		MessageCrossTargetForwarded: "📤 已按请求转发至 %s:%q",
 	})
 }

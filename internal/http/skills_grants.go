@@ -2,7 +2,6 @@ package http
 
 import (
 	"archive/zip"
-	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -45,9 +44,9 @@ func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Ownership check (admins bypass)
-	auth := resolveAuth(r, h.token)
+	auth := resolveAuth(r)
 	if !permissions.HasMinRole(auth.Role, permissions.RoleAdmin) {
-		if ownerID, found := h.skills.GetSkillOwnerID(skillID); found && ownerID != userID {
+		if ownerID, found := h.skills.GetSkillOwnerID(r.Context(), skillID); found && ownerID != userID {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the skill owner can perform this action"})
 			return
 		}
@@ -57,8 +56,7 @@ func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request)
 		AgentID string `json:"agent_id"`
 		Version int    `json:"version"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &req) {
 		return
 	}
 
@@ -78,7 +76,7 @@ func (h *SkillsHandler) handleGrantAgent(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusCreated, map[string]string{"ok": "true"})
 }
@@ -93,10 +91,10 @@ func (h *SkillsHandler) handleRevokeAgent(w http.ResponseWriter, r *http.Request
 	}
 
 	// Ownership check (admins bypass)
-	auth := resolveAuth(r, h.token)
+	auth := resolveAuth(r)
 	if !permissions.HasMinRole(auth.Role, permissions.RoleAdmin) {
 		userID := store.UserIDFromContext(r.Context())
-		if ownerID, found := h.skills.GetSkillOwnerID(skillID); found && ownerID != userID {
+		if ownerID, found := h.skills.GetSkillOwnerID(r.Context(), skillID); found && ownerID != userID {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the skill owner can perform this action"})
 			return
 		}
@@ -115,7 +113,7 @@ func (h *SkillsHandler) handleRevokeAgent(w http.ResponseWriter, r *http.Request
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }
@@ -131,9 +129,9 @@ func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// Ownership check (admins bypass)
-	auth := resolveAuth(r, h.token)
+	auth := resolveAuth(r)
 	if !permissions.HasMinRole(auth.Role, permissions.RoleAdmin) {
-		if ownerID, found := h.skills.GetSkillOwnerID(skillID); found && ownerID != userID {
+		if ownerID, found := h.skills.GetSkillOwnerID(r.Context(), skillID); found && ownerID != userID {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the skill owner can perform this action"})
 			return
 		}
@@ -142,8 +140,7 @@ func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) 
 	var req struct {
 		UserID string `json:"user_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": i18n.T(locale, i18n.MsgInvalidJSON)})
+	if !bindJSON(w, r, locale, &req) {
 		return
 	}
 	if req.UserID == "" {
@@ -161,7 +158,7 @@ func (h *SkillsHandler) handleGrantUser(w http.ResponseWriter, r *http.Request) 
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusCreated, map[string]string{"ok": "true"})
 }
@@ -176,10 +173,10 @@ func (h *SkillsHandler) handleRevokeUser(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Ownership check (admins bypass)
-	auth := resolveAuth(r, h.token)
+	auth := resolveAuth(r)
 	if !permissions.HasMinRole(auth.Role, permissions.RoleAdmin) {
 		userID := store.UserIDFromContext(r.Context())
-		if ownerID, found := h.skills.GetSkillOwnerID(skillID); found && ownerID != userID {
+		if ownerID, found := h.skills.GetSkillOwnerID(r.Context(), skillID); found && ownerID != userID {
 			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only the skill owner can perform this action"})
 			return
 		}
@@ -196,7 +193,7 @@ func (h *SkillsHandler) handleRevokeUser(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.skills.BumpVersion()
-	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "")
+	h.emitCacheInvalidate(bus.CacheKindSkillGrants, "", uuid.Nil)
 	emitAudit(h.msgBus, r, "skill.grant_changed", "skill", idStr)
 	writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 }

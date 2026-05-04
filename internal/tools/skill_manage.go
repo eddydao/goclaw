@@ -13,22 +13,49 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
-	"github.com/nextlevelbuilder/goclaw/internal/store/pg"
 )
 
 // SkillManageTool provides agent-driven skill lifecycle management.
 // Complements publish_skill (directory-based) with a content-string interface
 // so agents can create/patch/delete skills without pre-writing files to disk.
 type SkillManageTool struct {
-	skills *pg.PGSkillStore
-	base   string         // skills-store/ base directory
-	loader *skills.Loader // cache invalidation
+	skills  store.SkillManageStore
+	base    string         // skills-store/ base directory (master tenant)
+	dataDir string         // parent data dir for tenant-scoped skill paths
+	loader  *skills.Loader // cache invalidation
 }
 
-func NewSkillManageTool(skills *pg.PGSkillStore, baseDir string, loader *skills.Loader) *SkillManageTool {
-	return &SkillManageTool{skills: skills, base: baseDir, loader: loader}
+func NewSkillManageTool(skills store.SkillManageStore, baseDir, dataDir string, loader *skills.Loader) *SkillManageTool {
+	return &SkillManageTool{skills: skills, base: baseDir, dataDir: dataDir, loader: loader}
+}
+
+// isOwnerOfSkill returns true if the caller owns the skill identified by slug.
+// Matches owner_id against three identities for backward compatibility (#915):
+//   - ActorIDFromContext: current helper, merge-aware in DM, sender in groups
+//   - UserIDFromContext:  legacy rows pre-#915 (group-scope) and merged tenant id
+//   - SenderIDFromContext: raw channel sender (covers the pre-merge-aware ActorID window)
+//
+// If the slug does not exist, returns true (caller sees "skill not found" error
+// from the downstream resolver — preserves the existing error surface).
+func isOwnerOfSkill(ctx context.Context, skills store.SkillManageStore, slug string) bool {
+	ownerID, found := skills.GetSkillOwnerIDBySlug(ctx, slug)
+	if !found {
+		return true
+	}
+	actorID := store.ActorIDFromContext(ctx)
+	userID := store.UserIDFromContext(ctx)
+	senderID := store.SenderIDFromContext(ctx)
+	return ownerID == actorID || ownerID == userID || ownerID == senderID
+}
+
+// tenantSkillsDir returns the skills-store directory scoped to the calling agent's tenant.
+func (t *SkillManageTool) tenantSkillsDir(ctx context.Context) string {
+	tid := store.TenantIDFromContext(ctx)
+	slug := store.TenantSlugFromContext(ctx)
+	return config.TenantSkillsStoreDir(t.dataDir, tid, slug)
 }
 
 func (t *SkillManageTool) Name() string { return "skill_manage" }
@@ -124,9 +151,9 @@ func (t *SkillManageTool) executeCreate(ctx context.Context, args map[string]any
 		return ErrorResult(fmt.Sprintf("cannot manage system skill %q", slug))
 	}
 
-	// Version + destination
-	version := t.skills.GetNextVersion(slug)
-	destDir := filepath.Join(t.base, slug, fmt.Sprintf("%d", version))
+	// Version + destination (tenant-scoped)
+	version := t.skills.GetNextVersion(ctx, slug)
+	destDir := filepath.Join(t.tenantSkillsDir(ctx), slug, fmt.Sprintf("%d", version))
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create skill directory: %v", err))
 	}
@@ -144,17 +171,18 @@ func (t *SkillManageTool) executeCreate(ctx context.Context, args map[string]any
 	fileHash := fmt.Sprintf("%x", hasher.Sum(nil))
 	fileSize := int64(len(contentBytes))
 
-	// DB insert
-	userID := store.UserIDFromContext(ctx)
-	if userID == "" {
-		userID = "system"
+	// DB insert — owner = actor (real sender) so skill belongs to the individual
+	// user rather than the group principal in group chats (#915).
+	ownerID := store.ActorIDFromContext(ctx)
+	if ownerID == "" {
+		ownerID = "system"
 	}
 	desc := description
-	id, err := t.skills.CreateSkillManaged(ctx, pg.SkillCreateParams{
+	id, err := t.skills.CreateSkillManaged(ctx, store.SkillCreateParams{
 		Name:        name,
 		Slug:        slug,
 		Description: &desc,
-		OwnerID:     userID,
+		OwnerID:     ownerID,
 		Visibility:  "private",
 		Version:     version,
 		FilePath:    destDir,
@@ -166,13 +194,13 @@ func (t *SkillManageTool) executeCreate(ctx context.Context, args map[string]any
 		return ErrorResult(fmt.Sprintf("failed to register skill: %v", err))
 	}
 
-	slog.Info("skill_manage: created", "id", id, "slug", slug, "version", version, "owner", userID)
+	slog.Info("skill_manage: created", "id", id, "slug", slug, "version", version, "owner", ownerID)
 
-	// Auto-grant to calling agent
+	// Auto-grant to calling agent (granted-by = owner, same as CreateSkillManaged)
 	granted := false
 	agentID := store.AgentIDFromContext(ctx)
 	if agentID != uuid.Nil {
-		if err := t.skills.GrantToAgent(ctx, id, agentID, version, userID); err != nil {
+		if err := t.skills.GrantToAgent(ctx, id, agentID, version, ownerID); err != nil {
 			slog.Warn("skill_manage: auto-grant failed", "error", err)
 		} else {
 			granted = true
@@ -189,7 +217,7 @@ func (t *SkillManageTool) executeCreate(ctx context.Context, args map[string]any
 	if manifest != nil && !manifest.IsEmpty() {
 		ok, missing := skills.CheckSkillDeps(manifest)
 		if !ok {
-			_ = t.skills.StoreMissingDeps(id, missing)
+			_ = t.skills.StoreMissingDeps(ctx, id, missing)
 			depsWarning = skills.FormatMissing(missing)
 		}
 	}
@@ -217,7 +245,7 @@ func (t *SkillManageTool) executePatch(ctx context.Context, args map[string]any)
 		return ErrorResult("find is required for action=patch")
 	}
 
-	info, ok := t.skills.GetSkill(slug)
+	info, ok := t.skills.GetSkill(ctx, slug)
 	if !ok {
 		return ErrorResult(fmt.Sprintf("skill %q not found or archived", slug))
 	}
@@ -225,9 +253,16 @@ func (t *SkillManageTool) executePatch(ctx context.Context, args map[string]any)
 		return ErrorResult(fmt.Sprintf("cannot manage system skill %q", slug))
 	}
 
-	// Ownership check: only the skill owner can patch
-	userID := store.UserIDFromContext(ctx)
-	if ownerID, found := t.skills.GetSkillOwnerIDBySlug(slug); found && ownerID != userID {
+	// Ownership check: only the skill owner can patch.
+	// Accept any of three identities the same human maps to:
+	//   - actor (current merge-aware helper — preferred for new rows)
+	//   - userID (legacy pre-#915 rows where owner_id was group principal
+	//     or the merged tenant identity)
+	//   - senderID (legacy rows from the pre-merge-aware ActorID window
+	//     where DM owners got the raw channel sender)
+	// A DM user merged to "viettx" with Telegram ID "386246614" matches all
+	// three of their skills regardless of when they were created.
+	if !isOwnerOfSkill(ctx, t.skills, slug) {
 		return ErrorResult(fmt.Sprintf("cannot manage skill %q: you are not the owner", slug))
 	}
 
@@ -254,7 +289,7 @@ func (t *SkillManageTool) executePatch(ctx context.Context, args map[string]any)
 		return ErrorResult(fmt.Sprintf("failed to lock version: %v", lockErr))
 	}
 	defer commitLock() //nolint:errcheck
-	destDir := filepath.Join(t.base, slug, fmt.Sprintf("%d", newVer))
+	destDir := filepath.Join(t.tenantSkillsDir(ctx), slug, fmt.Sprintf("%d", newVer))
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create new version directory: %v", err))
 	}
@@ -281,7 +316,7 @@ func (t *SkillManageTool) executePatch(ctx context.Context, args map[string]any)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("invalid skill ID in database: %v", err))
 	}
-	if err := t.skills.UpdateSkill(skillID, map[string]any{
+	if err := t.skills.UpdateSkill(ctx, skillID, map[string]any{
 		"version":    newVer,
 		"file_path":  destDir,
 		"file_size":  fileSize,
@@ -307,7 +342,7 @@ func (t *SkillManageTool) executeDelete(ctx context.Context, args map[string]any
 		return ErrorResult("slug is required for action=delete")
 	}
 
-	info, ok := t.skills.GetSkill(slug)
+	info, ok := t.skills.GetSkill(ctx, slug)
 	if !ok {
 		return ErrorResult(fmt.Sprintf("skill %q not found or already archived", slug))
 	}
@@ -315,19 +350,20 @@ func (t *SkillManageTool) executeDelete(ctx context.Context, args map[string]any
 		return ErrorResult(fmt.Sprintf("cannot manage system skill %q", slug))
 	}
 
-	// Ownership check: only the skill owner can delete
-	deleteUserID := store.UserIDFromContext(ctx)
-	if ownerID, found := t.skills.GetSkillOwnerIDBySlug(slug); found && ownerID != deleteUserID {
+	// Ownership check: only the skill owner can delete.
+	// Same three-identity match as the patch flow above (#915).
+	if !isOwnerOfSkill(ctx, t.skills, slug) {
 		return ErrorResult(fmt.Sprintf("cannot manage skill %q: you are not the owner", slug))
 	}
 
 	// Soft-delete on disk: move to .trash/<slug>.<unix-timestamp>
-	trashDir := filepath.Join(t.base, ".trash")
+	skillsDir := t.tenantSkillsDir(ctx)
+	trashDir := filepath.Join(skillsDir, ".trash")
 	if err := os.MkdirAll(trashDir, 0755); err != nil {
 		slog.Warn("skill_manage: failed to create .trash dir", "error", err)
 	} else {
 		timestamp := fmt.Sprintf("%d", time.Now().Unix())
-		src := filepath.Join(t.base, slug)
+		src := filepath.Join(skillsDir, slug)
 		dst := filepath.Join(trashDir, slug+"."+timestamp)
 		if err := os.Rename(src, dst); err != nil {
 			// Cross-device rename fails on some setups — log and continue (DB archive is primary)
@@ -340,7 +376,7 @@ func (t *SkillManageTool) executeDelete(ctx context.Context, args map[string]any
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("invalid skill ID in database: %v", err))
 	}
-	if err := t.skills.DeleteSkill(skillID); err != nil {
+	if err := t.skills.DeleteSkill(ctx, skillID); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to archive skill in database: %v", err))
 	}
 
@@ -350,7 +386,7 @@ func (t *SkillManageTool) executeDelete(ctx context.Context, args map[string]any
 		t.loader.BumpVersion()
 	}
 
-	return NewResult(fmt.Sprintf("Skill %q archived and removed from search.", slug))
+	return NewResult(fmt.Sprintf("Skill %q deleted and removed from search.", slug))
 }
 
 // maxCopySize limits total companion file copy to 20MB (matching publish_skill).

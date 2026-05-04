@@ -12,9 +12,9 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/skills"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
-	"github.com/nextlevelbuilder/goclaw/internal/store/pg"
 )
 
 const maxSkillDirSize = 20 << 20 // 20 MB
@@ -22,13 +22,21 @@ const maxSkillDirSize = 20 << 20 // 20 MB
 // PublishSkillTool registers a skill directory in the database,
 // making it discoverable and grantable to agents.
 type PublishSkillTool struct {
-	skills *pg.PGSkillStore
-	base   string         // skills-store/ directory
-	loader *skills.Loader // cache invalidation
+	skills  store.SkillManageStore
+	base    string         // skills-store/ directory (master tenant)
+	dataDir string         // parent data dir for tenant-scoped skill paths
+	loader  *skills.Loader // cache invalidation
 }
 
-func NewPublishSkillTool(skills *pg.PGSkillStore, baseDir string, loader *skills.Loader) *PublishSkillTool {
-	return &PublishSkillTool{skills: skills, base: baseDir, loader: loader}
+func NewPublishSkillTool(skills store.SkillManageStore, baseDir, dataDir string, loader *skills.Loader) *PublishSkillTool {
+	return &PublishSkillTool{skills: skills, base: baseDir, dataDir: dataDir, loader: loader}
+}
+
+// tenantSkillsDir returns the skills-store directory scoped to the calling agent's tenant.
+func (t *PublishSkillTool) tenantSkillsDir(ctx context.Context) string {
+	tid := store.TenantIDFromContext(ctx)
+	slug := store.TenantSlugFromContext(ctx)
+	return config.TenantSkillsStoreDir(t.dataDir, tid, slug)
 }
 
 func (t *PublishSkillTool) Name() string { return "publish_skill" }
@@ -109,9 +117,9 @@ func (t *PublishSkillTool) Execute(ctx context.Context, args map[string]any) *Re
 		return ErrorResult(fmt.Sprintf("skill directory exceeds size limit (%d MB)", maxSkillDirSize>>20))
 	}
 
-	// Version + destination
-	version := t.skills.GetNextVersion(slug)
-	destDir := filepath.Join(t.base, slug, fmt.Sprintf("%d", version))
+	// Version + destination (tenant-scoped)
+	version := t.skills.GetNextVersion(ctx, slug)
+	destDir := filepath.Join(t.tenantSkillsDir(ctx), slug, fmt.Sprintf("%d", version))
 	if err := os.MkdirAll(destDir, 0755); err != nil {
 		return ErrorResult(fmt.Sprintf("failed to create destination: %v", err))
 	}
@@ -121,17 +129,18 @@ func (t *PublishSkillTool) Execute(ctx context.Context, args map[string]any) *Re
 		return ErrorResult(fmt.Sprintf("failed to copy skill files: %v", err))
 	}
 
-	// Insert into DB
-	userID := store.UserIDFromContext(ctx)
-	if userID == "" {
-		userID = "system" // fallback for agent-only contexts
+	// Insert into DB — owner = actor (real sender) so a skill published in a
+	// group chat belongs to the individual user, not the group principal (#915).
+	ownerID := store.ActorIDFromContext(ctx)
+	if ownerID == "" {
+		ownerID = "system" // fallback for agent-only contexts
 	}
 	desc := description
-	params := pg.SkillCreateParams{
+	params := store.SkillCreateParams{
 		Name:        name,
 		Slug:        slug,
 		Description: &desc,
-		OwnerID:     userID,
+		OwnerID:     ownerID,
 		Visibility:  "private",
 		Version:     version,
 		FilePath:    destDir,
@@ -145,12 +154,12 @@ func (t *PublishSkillTool) Execute(ctx context.Context, args map[string]any) *Re
 		return ErrorResult(fmt.Sprintf("failed to register skill: %v", err))
 	}
 
-	slog.Info("skill published", "id", id, "slug", slug, "version", version, "owner", userID)
+	slog.Info("skill published", "id", id, "slug", slug, "version", version, "owner", ownerID)
 
-	// Auto-grant to calling agent
+	// Auto-grant to calling agent (granted-by = owner, same as CreateSkillManaged)
 	agentID := store.AgentIDFromContext(ctx)
 	if agentID != uuid.Nil {
-		if err := t.skills.GrantToAgent(ctx, id, agentID, version, userID); err != nil {
+		if err := t.skills.GrantToAgent(ctx, id, agentID, version, ownerID); err != nil {
 			slog.Warn("publish_skill: auto-grant failed", "error", err)
 		}
 	}
@@ -166,7 +175,7 @@ func (t *PublishSkillTool) Execute(ctx context.Context, args map[string]any) *Re
 	if manifest != nil && !manifest.IsEmpty() {
 		ok, missing := skills.CheckSkillDeps(manifest)
 		if !ok {
-			_ = t.skills.StoreMissingDeps(id, missing)
+			_ = t.skills.StoreMissingDeps(ctx, id, missing)
 			depsWarning = skills.FormatMissing(missing)
 		}
 	}

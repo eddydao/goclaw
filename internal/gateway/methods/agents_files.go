@@ -3,12 +3,10 @@ package methods
 import (
 	"context"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"log/slog"
 	"slices"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
-	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
@@ -19,7 +17,8 @@ import (
 // TOOLS.md excluded — not applicable.
 var allowedAgentFiles = []string{
 	bootstrap.AgentsFile, bootstrap.SoulFile, bootstrap.IdentityFile,
-	bootstrap.UserFile, bootstrap.UserPredefinedFile, bootstrap.BootstrapFile, bootstrap.MemoryJSONFile,
+	bootstrap.UserFile, bootstrap.UserPredefinedFile, bootstrap.CapabilitiesFile,
+	bootstrap.BootstrapFile, bootstrap.MemoryJSONFile,
 	bootstrap.HeartbeatFile,
 }
 
@@ -38,7 +37,7 @@ func (m *AgentsMethods) handleFilesList(ctx context.Context, client *gateway.Cli
 
 	if m.agentStore != nil {
 		// --- DB-backed: list from store ---
-		ctx := context.Background()
+
 		ag, err := m.agentStore.GetByKey(ctx, params.AgentID)
 		if err != nil {
 			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgAgentNotFound, params.AgentID)))
@@ -79,36 +78,6 @@ func (m *AgentsMethods) handleFilesList(ctx context.Context, client *gateway.Cli
 		}))
 		return
 	}
-
-	// --- Fallback: filesystem ---
-	ws := m.resolveWorkspace(params.AgentID)
-	files := make([]map[string]any, 0, len(allowedAgentFiles))
-
-	for _, name := range allowedAgentFiles {
-		p := filepath.Join(ws, name)
-		info, err := os.Stat(p)
-		if err != nil {
-			files = append(files, map[string]any{
-				"name":    name,
-				"path":    p,
-				"missing": true,
-			})
-		} else {
-			files = append(files, map[string]any{
-				"name":        name,
-				"path":        p,
-				"missing":     false,
-				"size":        info.Size(),
-				"updatedAtMs": info.ModTime().UnixMilli(),
-			})
-		}
-	}
-
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
-		"agentId":   params.AgentID,
-		"workspace": ws,
-		"files":     files,
-	}))
 }
 
 // --- agents.files.get ---
@@ -137,7 +106,7 @@ func (m *AgentsMethods) handleFilesGet(ctx context.Context, client *gateway.Clie
 
 	if m.agentStore != nil {
 		// --- DB-backed: read from store ---
-		ctx := context.Background()
+
 		ag, err := m.agentStore.GetByKey(ctx, params.AgentID)
 		if err != nil {
 			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgAgentNotFound, params.AgentID)))
@@ -175,38 +144,6 @@ func (m *AgentsMethods) handleFilesGet(ctx context.Context, client *gateway.Clie
 		}))
 		return
 	}
-
-	// --- Fallback: filesystem ---
-	ws := m.resolveWorkspace(params.AgentID)
-	p := filepath.Join(ws, params.Name)
-
-	info, err := os.Stat(p)
-	if err != nil {
-		client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
-			"agentId":   params.AgentID,
-			"workspace": ws,
-			"file": map[string]any{
-				"name":    params.Name,
-				"path":    p,
-				"missing": true,
-			},
-		}))
-		return
-	}
-
-	content, _ := os.ReadFile(p)
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
-		"agentId":   params.AgentID,
-		"workspace": ws,
-		"file": map[string]any{
-			"name":        params.Name,
-			"path":        p,
-			"missing":     false,
-			"size":        info.Size(),
-			"updatedAtMs": info.ModTime().UnixMilli(),
-			"content":     string(content),
-		},
-	}))
 }
 
 // --- agents.files.set ---
@@ -215,9 +152,10 @@ func (m *AgentsMethods) handleFilesGet(ctx context.Context, client *gateway.Clie
 func (m *AgentsMethods) handleFilesSet(ctx context.Context, client *gateway.Client, req *protocol.RequestFrame) {
 	locale := store.LocaleFromContext(ctx)
 	var params struct {
-		AgentID string `json:"agentId"`
-		Name    string `json:"name"`
-		Content string `json:"content"`
+		AgentID   string `json:"agentId"`
+		Name      string `json:"name"`
+		Content   string `json:"content"`
+		Propagate bool   `json:"propagate"` // push change to all existing user instances
 	}
 	if req.Params != nil {
 		json.Unmarshal(req.Params, &params)
@@ -236,7 +174,7 @@ func (m *AgentsMethods) handleFilesSet(ctx context.Context, client *gateway.Clie
 
 	if m.agentStore != nil {
 		// --- DB-backed: write to store ---
-		ctx := context.Background()
+
 		ag, err := m.agentStore.GetByKey(ctx, params.AgentID)
 		if err != nil {
 			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, i18n.T(locale, i18n.MsgAgentNotFound, params.AgentID)))
@@ -246,6 +184,17 @@ func (m *AgentsMethods) handleFilesSet(ctx context.Context, client *gateway.Clie
 		if err := m.agentStore.SetAgentContextFile(ctx, ag.ID, params.Name, params.Content); err != nil {
 			client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToSave, "file", err.Error())))
 			return
+		}
+
+		// Propagate to all existing user instances if requested (#294).
+		var propagated int
+		if params.Propagate {
+			n, err := m.agentStore.PropagateContextFile(ctx, ag.ID, params.Name)
+			if err != nil {
+				slog.Warn("agents.files.set: propagation failed", "agent", params.AgentID, "file", params.Name, "error", err)
+			} else {
+				propagated = n
+			}
 		}
 
 		// Invalidate both caches so the new content is served immediately
@@ -263,43 +212,13 @@ func (m *AgentsMethods) handleFilesSet(ctx context.Context, client *gateway.Clie
 				"size":    len(params.Content),
 				"content": params.Content,
 			},
+			"propagated": propagated,
 		}))
 		return
 	}
-
-	// --- Fallback: filesystem ---
-	ws := m.resolveWorkspace(params.AgentID)
-	os.MkdirAll(ws, 0755)
-	p := filepath.Join(ws, params.Name)
-
-	if err := os.WriteFile(p, []byte(params.Content), 0644); err != nil {
-		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrInternal, i18n.T(locale, i18n.MsgFailedToSave, "file", err.Error())))
-		return
-	}
-
-	info, _ := os.Stat(p)
-	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
-		"agentId":   params.AgentID,
-		"workspace": ws,
-		"file": map[string]any{
-			"name":        params.Name,
-			"path":        p,
-			"missing":     false,
-			"size":        info.Size(),
-			"updatedAtMs": info.ModTime().UnixMilli(),
-			"content":     params.Content,
-		},
-	}))
 }
 
 // --- Helpers ---
-
-func (m *AgentsMethods) resolveWorkspace(agentID string) string {
-	if spec, ok := m.cfg.Agents.List[agentID]; ok && spec.Workspace != "" {
-		return config.ExpandHome(spec.Workspace)
-	}
-	return config.ExpandHome(m.cfg.Agents.Defaults.Workspace)
-}
 
 func isAllowedFile(name string) bool {
 	return slices.Contains(allowedAgentFiles, name)

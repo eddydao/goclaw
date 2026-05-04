@@ -13,10 +13,6 @@ import (
 
 // resolveDocumentFile finds the document file path from context MediaRefs.
 func (t *ReadDocumentTool) resolveDocumentFile(ctx context.Context, mediaID string) (path, mime string, err error) {
-	if t.mediaLoader == nil {
-		return "", "", fmt.Errorf("no media storage configured — cannot access document files")
-	}
-
 	refs := MediaDocRefsFromCtx(ctx)
 	if len(refs) == 0 {
 		return "", "", fmt.Errorf("no documents available in this conversation. The user may not have sent a document.")
@@ -39,9 +35,17 @@ func (t *ReadDocumentTool) resolveDocumentFile(ctx context.Context, mediaID stri
 		ref = &refs[len(refs)-1]
 	}
 
-	p, err := t.mediaLoader.LoadPath(ref.ID)
-	if err != nil {
-		return "", "", fmt.Errorf("document file not found: %v", err)
+	// Prefer persisted workspace path; fall back to legacy .media/ lookup.
+	p := ref.Path
+	if p == "" {
+		var err error
+		if t.mediaLoader == nil {
+			return "", "", fmt.Errorf("no media storage configured")
+		}
+		p, err = t.mediaLoader.LoadPath(ref.ID)
+		if err != nil {
+			return "", "", fmt.Errorf("document file not found: %v", err)
+		}
 	}
 
 	// Determine MIME type: prefer ref's stored MIME, fall back to extension.
@@ -75,12 +79,25 @@ func (t *ReadDocumentTool) callProvider(ctx context.Context, cp credentialProvid
 	}
 
 	// Other providers: use standard Chat API with document as base64 image_url.
-	p, err := t.registry.Get(providerName)
+	p, err := t.registry.Get(ctx, providerName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("provider %q not available: %w", providerName, err)
 	}
 
 	slog.Info("read_document: using chat API", "provider", providerName, "model", model, "doc_size", len(data))
+
+	opts := map[string]any{
+		"max_tokens":  16384,
+		"temperature": 0.2,
+	}
+	// Scope disable_tools to claude-cli only — it's a CLI-bridge-specific
+	// option that skips loading the built-in MCP toolset for one-shot calls.
+	// Other providers silently ignore unknown keys today, but leaking
+	// provider-specific flags into the shared Options map couples layers.
+	if providerName == "claude-cli" {
+		opts["disable_tools"] = true
+	}
+
 	resp, err := p.Chat(ctx, providers.ChatRequest{
 		Messages: []providers.Message{
 			{
@@ -89,11 +106,8 @@ func (t *ReadDocumentTool) callProvider(ctx context.Context, cp credentialProvid
 				Images:  []providers.ImageContent{{MimeType: mime, Data: base64.StdEncoding.EncodeToString(data)}},
 			},
 		},
-		Model: model,
-		Options: map[string]any{
-			"max_tokens":  16384,
-			"temperature": 0.2,
-		},
+		Model:   model,
+		Options: opts,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("chat call: %w", err)

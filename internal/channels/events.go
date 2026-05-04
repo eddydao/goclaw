@@ -6,13 +6,16 @@ import (
 	"log/slog"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // HandleAgentEvent routes agent lifecycle events to streaming/reaction channels.
 // Called from the bus event subscriber — must be non-blocking.
-// eventType: "run.started", "chunk", "tool.call", "tool.result", "run.completed", "run.failed"
+// eventType: "run.started", "chunk", "tool.call", "tool.result", "run.completed", "run.failed", "run.cancelled"
 func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 	val, ok := m.runs.Load(runID)
 	if !ok {
@@ -28,9 +31,18 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 	}
 
 	ctx := context.Background()
+	// Use RunContext's TenantID directly (set at RegisterRun time from channel instance)
+	// rather than querying the channel interface - more direct and future-proof for
+	// channels that might serve multiple tenants.
+	if rc.TenantID != uuid.Nil {
+		ctx = store.WithTenantID(ctx, rc.TenantID)
+	}
 
-	// Forward to StreamingChannel
-	if sc, ok := ch.(StreamingChannel); ok {
+	// Forward to StreamingChannel (only when streaming is enabled for this run).
+	// Without this gate, channels that implement StreamingChannel but have streaming
+	// disabled (e.g. group_stream=false) would create stream messages AND emit
+	// block.reply outbound messages, causing duplicate delivery.
+	if sc, ok := ch.(StreamingChannel); ok && rc.Streaming {
 		switch eventType {
 		case protocol.AgentEventRunStarted:
 			stream, err := sc.CreateStream(ctx, rc.ChatID, true)
@@ -102,6 +114,7 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 					ChatID:   rc.ChatID,
 					Content:  statusText,
 					Metadata: outMeta,
+					TenantID: rc.TenantID,
 				})
 			}
 		case protocol.ChatEventChunk:
@@ -230,6 +243,25 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 			if currentStream != nil {
 				_ = currentStream.Stop(ctx)
 			}
+			// Issue 958: Send user-friendly error message instead of silent "..."
+			errStr := extractPayloadString(payload, "error")
+			if friendlyMsg := FormatAgentError(errStr); friendlyMsg != "" {
+				m.bus.PublishOutbound(bus.OutboundMessage{
+					Channel:  rc.ChannelName,
+					ChatID:   rc.ChatID,
+					Content:  friendlyMsg,
+					TenantID: rc.TenantID,
+				})
+			}
+		case protocol.AgentEventRunCancelled:
+			// Clean up streaming state on cancellation
+			rc.mu.Lock()
+			currentStream := rc.stream
+			rc.stream = nil
+			rc.mu.Unlock()
+			if currentStream != nil {
+				_ = currentStream.Stop(ctx)
+			}
 		}
 	}
 
@@ -254,10 +286,12 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 
 		// Build outbound metadata: copy routing fields but strip reply_to_message_id
 		// (block replies are standalone) and placeholder_key (reserve for final message).
+		// feishu_reply_target_id MUST be preserved so intermediate block replies for
+		// threaded Lark messages also land inside the same thread.
 		var outMeta map[string]string
 		if rc.Metadata != nil {
 			outMeta = make(map[string]string)
-			for _, k := range []string{"message_thread_id", "local_key", "group_id"} {
+			for _, k := range routingMetaKeys {
 				if v := rc.Metadata[k]; v != "" {
 					outMeta[k] = v
 				}
@@ -272,6 +306,7 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 			ChatID:   rc.ChatID,
 			Content:  content,
 			Metadata: outMeta,
+			TenantID: rc.TenantID,
 		})
 		return
 	}
@@ -282,9 +317,10 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 		maxAttempts := extractPayloadString(payload, "maxAttempts")
 		retryMsg := fmt.Sprintf("Provider busy, retrying... (%s/%s)", attempt, maxAttempts)
 		m.bus.PublishOutbound(bus.OutboundMessage{
-			Channel: rc.ChannelName,
-			ChatID:  rc.ChatID,
-			Content: retryMsg,
+			Channel:  rc.ChannelName,
+			ChatID:   rc.ChatID,
+			Content:  retryMsg,
+			TenantID: rc.TenantID,
 			Metadata: map[string]string{
 				"placeholder_update": "true",
 			},
@@ -306,6 +342,8 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 			status = "done"
 		case protocol.AgentEventRunFailed:
 			status = "error"
+		case protocol.AgentEventRunCancelled:
+			status = "done"
 		}
 		if status != "" {
 			if err := reactionCh.OnReactionEvent(ctx, rc.ChatID, rc.MessageID, status); err != nil {
@@ -315,7 +353,7 @@ func (m *Manager) HandleAgentEvent(eventType, runID string, payload any) {
 	}
 
 	// Clean up on terminal events
-	if eventType == protocol.AgentEventRunCompleted || eventType == protocol.AgentEventRunFailed {
+	if eventType == protocol.AgentEventRunCompleted || eventType == protocol.AgentEventRunFailed || eventType == protocol.AgentEventRunCancelled {
 		m.runs.Delete(runID)
 	}
 }
@@ -333,17 +371,6 @@ func extractPayloadString(payload any, key string) string {
 	return ""
 }
 
-// copyRoutingMeta copies channel routing metadata (thread_id, local_key, group_id)
-// from RunContext.Metadata into a new map suitable for outbound messages.
-func copyRoutingMeta(src map[string]string) map[string]string {
-	out := make(map[string]string)
-	for _, k := range []string{"message_thread_id", "local_key", "group_id"} {
-		if v := src[k]; v != "" {
-			out[k] = v
-		}
-	}
-	return out
-}
 
 // toolStatusMap maps builtin tool names to user-friendly status messages.
 var toolStatusMap = map[string]string{
@@ -375,7 +402,6 @@ var toolStatusMap = map[string]string{
 	// Delegation & teams
 	"spawn":        "👥 Delegating task...",
 	"team_tasks":   "📋 Managing team tasks...",
-	"team_message": "💬 Sending team message...",
 	// Sessions
 	"sessions_list":    "📋 Listing sessions...",
 	"session_status":   "📋 Checking session...",

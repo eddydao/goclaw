@@ -9,11 +9,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
 	"github.com/nextlevelbuilder/goclaw/internal/config"
+	"github.com/nextlevelbuilder/goclaw/internal/providerresolve"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 )
+
+// reloadStartTimeout bounds how long Reload() will wait for a single channel's
+// Start() to return before abandoning it and continuing with the rest.
+// Sits above Telegram's probeOverallTimeout (60s) so well-behaved channels
+// always get a chance to finish before being given up on.
+// var (not const) so tests can shrink it without waiting a real minute+.
+var reloadStartTimeout = 90 * time.Second
 
 // ChannelFactory creates a Channel from DB instance data.
 // name: channel name (registered in Manager, used in session keys).
@@ -23,18 +33,18 @@ type ChannelFactory func(name string, creds json.RawMessage, cfg json.RawMessage
 	msgBus *bus.MessageBus, pairingSvc store.PairingStore) (Channel, error)
 
 // InstanceLoader loads channel instances from the database and registers them with the Manager.
-// Follows the DynamicToolLoader pattern: LoadAll at startup, Reload on cache invalidation.
+// Follows a load-all-at-startup pattern with cache invalidation for reload.
 type InstanceLoader struct {
-	store       store.ChannelInstanceStore
-	agentStore  store.AgentStore
-	providerReg        *providers.Registry
-	pendingCompactCfg  *config.PendingCompactionConfig
-	factories          map[string]ChannelFactory
-	manager            *Manager
-	msgBus             *bus.MessageBus
-	pairingSvc         store.PairingStore
-	mu                 sync.Mutex
-	loaded             map[string]struct{} // channel names managed by this loader
+	store             store.ChannelInstanceStore
+	agentStore        store.AgentStore
+	providerReg       *providers.Registry
+	pendingCompactCfg *config.PendingCompactionConfig
+	factories         map[string]ChannelFactory
+	manager           *Manager
+	msgBus            *bus.MessageBus
+	pairingSvc        store.PairingStore
+	mu                sync.Mutex
+	loaded            map[string]struct{} // channel names managed by this loader
 }
 
 // NewInstanceLoader creates a new InstanceLoader.
@@ -78,7 +88,7 @@ func (l *InstanceLoader) LoadAll(ctx context.Context) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	instances, err := l.store.ListEnabled(ctx)
+	instances, err := l.store.ListAllEnabled(ctx)
 	if err != nil {
 		return err
 	}
@@ -120,8 +130,8 @@ func (l *InstanceLoader) Reload(ctx context.Context) {
 	// Brief pause to let external APIs (e.g., Telegram getUpdates) release polling locks.
 	time.Sleep(500 * time.Millisecond)
 
-	// Reload from DB
-	instances, err := l.store.ListEnabled(ctx)
+	// Reload from DB (all tenants — server-internal)
+	instances, err := l.store.ListAllEnabled(ctx)
 	if err != nil {
 		slog.Error("failed to reload channel instances", "error", err)
 		return
@@ -201,8 +211,18 @@ func (l *InstanceLoader) LoadedNames() map[string]struct{} {
 // If autoStart is true, the channel is started immediately (used by Reload).
 // If false, the caller is responsible for starting (used by LoadAll, where StartAll handles it).
 func (l *InstanceLoader) loadInstance(ctx context.Context, inst store.ChannelInstanceData, autoStart bool) error {
+	l.loaded[inst.Name] = struct{}{}
+
 	factory, ok := l.factories[inst.ChannelType]
 	if !ok {
+		l.manager.RecordHealth(inst.Name, NewChannelHealthForType(
+			inst.ChannelType,
+			ChannelHealthStateFailed,
+			"Unsupported channel type",
+			fmt.Sprintf("No channel factory is registered for %q", inst.ChannelType),
+			ChannelFailureKindConfig,
+			false,
+		))
 		slog.Warn("no factory for channel type", "type", inst.ChannelType, "name", inst.Name)
 		return nil
 	}
@@ -213,19 +233,31 @@ func (l *InstanceLoader) loadInstance(ctx context.Context, inst store.ChannelIns
 
 	ch, err := factory(inst.Name, inst.Credentials, cfg, l.msgBus, l.pairingSvc)
 	if err != nil {
+		l.manager.RecordFailureForType(inst.Name, inst.ChannelType, "", err)
 		return err
 	}
 	if ch == nil {
+		l.manager.RecordHealth(inst.Name, NewChannelHealthForType(
+			inst.ChannelType,
+			ChannelHealthStateFailed,
+			"Missing credentials",
+			"Channel instance is enabled but required credentials are incomplete.",
+			ChannelFailureKindConfig,
+			false,
+		))
 		slog.Info("channel instance not ready (missing credentials)", "name", inst.Name, "type", inst.ChannelType)
 		return nil
 	}
 
 	// Resolve agent_key from UUID — the routing system (Router, session keys) uses agent_key, not UUID.
+	// Use the instance's tenant_id to scope the agent lookup.
+	instCtx := store.WithTenantID(ctx, inst.TenantID)
 	var ag *store.AgentData
 	if base, ok := ch.(interface{ SetAgentID(string) }); ok {
 		var err error
-		ag, err = l.agentStore.GetByID(ctx, inst.AgentID)
+		ag, err = l.agentStore.GetByID(instCtx, inst.AgentID)
 		if err != nil {
+			l.manager.RecordFailureForType(inst.Name, inst.ChannelType, "", fmt.Errorf("agent %s not found for channel %s: %w", inst.AgentID, inst.Name, err))
 			return fmt.Errorf("agent %s not found for channel %s: %w", inst.AgentID, inst.Name, err)
 		}
 		base.SetAgentID(ag.AgentKey)
@@ -233,6 +265,15 @@ func (l *InstanceLoader) loadInstance(ctx context.Context, inst store.ChannelIns
 	// Set the platform type on the channel so Manager.ChannelTypeForName can read it.
 	if base, ok := ch.(interface{ SetType(string) }); ok {
 		base.SetType(inst.ChannelType)
+	}
+	// Propagate tenant_id from DB instance to channel for tenant-scoped message handling.
+	if base, ok := ch.(interface{ SetTenantID(uuid.UUID) }); ok {
+		base.SetTenantID(inst.TenantID)
+	}
+	// Propagate tenant_id to pending history for compaction/sweep DB operations.
+	// Factory creates PendingHistory before SetTenantID is called, so tenantID is uuid.Nil at construction.
+	if ph, ok := ch.(interface{ SetPendingHistoryTenantID(uuid.UUID) }); ok {
+		ph.SetPendingHistoryTenantID(inst.TenantID)
 	}
 
 	// Wire pending message auto-compaction.
@@ -242,8 +283,9 @@ func (l *InstanceLoader) loadInstance(ctx context.Context, inst store.ChannelIns
 		var model string
 
 		// Try config-level provider/model first.
+		tctx := store.WithTenantID(ctx, inst.TenantID)
 		if l.pendingCompactCfg != nil && l.pendingCompactCfg.Provider != "" {
-			if cp, err := l.providerReg.Get(l.pendingCompactCfg.Provider); err == nil {
+			if cp, err := l.providerReg.Get(tctx, l.pendingCompactCfg.Provider); err == nil {
 				p = cp
 				model = l.pendingCompactCfg.Model
 				if model == "" {
@@ -253,7 +295,7 @@ func (l *InstanceLoader) loadInstance(ctx context.Context, inst store.ChannelIns
 		}
 		// Fallback: agent's provider/model.
 		if p == nil && ag != nil && ag.Provider != "" {
-			if ap, err := l.providerReg.Get(ag.Provider); err == nil {
+			if ap, err := providerresolve.ResolveConfiguredProvider(l.providerReg, ag); err == nil {
 				p = ap
 				model = ag.Model
 				if model == "" {
@@ -275,20 +317,87 @@ func (l *InstanceLoader) loadInstance(ctx context.Context, inst store.ChannelIns
 			pc.SetPendingCompaction(cc)
 			slog.Debug("pending compaction configured", "channel", inst.Name, "provider", p.Name(), "model", model,
 				"threshold", cc.Threshold, "keep_recent", cc.KeepRecent, "max_tokens", cc.MaxTokens)
+		} else {
+			attemptedProvider := ""
+			if l.pendingCompactCfg != nil {
+				attemptedProvider = l.pendingCompactCfg.Provider
+			}
+			if attemptedProvider == "" && ag != nil {
+				attemptedProvider = ag.Provider
+			}
+			slog.Warn("pending compaction not configured: provider/model unavailable",
+				"channel", inst.Name, "agent_id", inst.AgentID, "attempted_provider", attemptedProvider)
 		}
 	}
 	l.manager.RegisterChannel(inst.Name, ch)
-	l.loaded[inst.Name] = struct{}{}
 
 	// Start the channel if requested (Reload path). LoadAll defers to StartAll.
+	// Bound the wait so one hung Start() can't block Reload()'s mutex and wedge
+	// every subsequent reload. Important: we pass the caller's ctx (not a
+	// timeout-wrapped one) to ch.Start so long-running goroutines the channel
+	// derives from it — e.g. Telegram's pollCtx — are not cancelled out from
+	// under a successful start.
 	if autoStart {
-		if err := ch.Start(ctx); err != nil {
-			slog.Error("channel instance start failed", "name", inst.Name, "error", err)
-			// Still registered — will show as not running.
-		}
+		l.startChannelWithTimeout(ctx, inst, ch)
 	}
 
 	slog.Info("channel instance loaded",
 		"name", inst.Name, "type", inst.ChannelType, "agent_id", inst.AgentID)
 	return nil
+}
+
+// startChannelWithTimeout runs ch.Start(ctx) in a goroutine and waits up to
+// reloadStartTimeout for it to return. On timeout we stop the partially-started
+// channel and record a failure so Reload() can move on to the next instance.
+//
+// ctx is passed through unchanged: channels routinely derive long-lived
+// goroutines (e.g. Telegram long-polling) from this context and must keep
+// running after Start returns. A late-returning Start — i.e. one that ignores
+// the caller ctx entirely — is drained asynchronously so its goroutine doesn't
+// block forever on the send to startErr. If it eventually reports success,
+// we've already called Stop, which is idempotent across channel impls.
+func (l *InstanceLoader) startChannelWithTimeout(ctx context.Context, inst store.ChannelInstanceData, ch Channel) {
+	startErr := make(chan error, 1)
+	go func() { startErr <- ch.Start(ctx) }()
+
+	timer := time.NewTimer(reloadStartTimeout)
+	defer timer.Stop()
+
+	select {
+	case err := <-startErr:
+		if err != nil {
+			l.manager.recordChannelStartFailure(inst.Name, ch, "", err)
+			slog.Error("channel instance start failed",
+				"name", inst.Name, "type", inst.ChannelType, "error", err)
+			return
+		}
+		l.manager.RecordHealth(inst.Name, snapshotChannelHealth(ch))
+
+	case <-timer.C:
+		// Stop the channel in a bounded window so we don't trade one hang for another.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if err := ch.Stop(stopCtx); err != nil {
+			slog.Warn("failed to stop timed-out channel",
+				"name", inst.Name, "type", inst.ChannelType, "error", err)
+		}
+		stopCancel()
+
+		timeoutErr := fmt.Errorf("start timed out after %s (type=%s)", reloadStartTimeout, inst.ChannelType)
+		l.manager.recordChannelStartFailure(inst.Name, ch, "", timeoutErr)
+		slog.Error("channel instance start timed out",
+			"name", inst.Name, "type", inst.ChannelType, "timeout", reloadStartTimeout)
+
+		// Drain the late-returning Start so its goroutine can exit.
+		// Logged so operators can spot channels that ignore context cancellation.
+		go func() {
+			err := <-startErr
+			if err != nil {
+				slog.Warn("channel instance start returned after timeout",
+					"name", inst.Name, "type", inst.ChannelType, "error", err)
+				return
+			}
+			slog.Warn("channel instance start succeeded after timeout; already stopped",
+				"name", inst.Name, "type", inst.ChannelType)
+		}()
+	}
 }

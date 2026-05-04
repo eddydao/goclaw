@@ -1,9 +1,11 @@
 package mcp
 
 import (
+	"slices"
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	mcpgo "github.com/mark3labs/mcp-go/mcp"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
@@ -14,7 +16,7 @@ func makeBridgeTool(serverName, toolName string) *BridgeTool {
 		Name:        toolName,
 		Description: "test tool " + toolName,
 		InputSchema: mcpgo.ToolInputSchema{Type: "object"},
-	}, nil, "", 30, nil)
+	}, nil, "", 30, nil, uuid.Nil, nil)
 }
 
 // setupSearchModeManager returns a Manager already in search mode with the given
@@ -245,13 +247,7 @@ func TestRegistry_WiredToManager_ActivatedToolAppearsInList(t *testing.T) {
 	reg.TryActivateDeferred(name)
 
 	// Appears in List() after activation.
-	found := false
-	for _, n := range reg.List() {
-		if n == name {
-			found = true
-			break
-		}
-	}
+	found := slices.Contains(reg.List(), name)
 	if !found {
 		t.Errorf("tool %q should appear in registry.List() after activation", name)
 	}

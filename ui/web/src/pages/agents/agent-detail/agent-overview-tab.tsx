@@ -8,23 +8,30 @@ import { PersonalitySection } from "./overview-sections/personality-section";
 import { ModelBudgetSection } from "./overview-sections/model-budget-section";
 import { SkillsSection } from "./overview-sections/skills-section";
 import { EvolutionSection } from "./overview-sections/evolution-section";
+import { PromptSettingsSection } from "./overview-sections/prompt-settings-section";
+import { PinnedSkillsSection } from "./overview-sections/pinned-skills-section";
+import { OrchestrationSection } from "./overview-sections/orchestration-section";
 import { CapabilitiesSection } from "./overview-sections/capabilities-section";
+import { ChatGPTOAuthRoutingSummarySection } from "./overview-sections/chatgpt-oauth-routing-summary-section";
 import { HeartbeatCard } from "./overview-sections/heartbeat-card";
+import { HooksSummaryCard } from "./overview-sections/hooks-summary-card";
+import { MemorySection } from "./config-sections";
 import type { UseAgentHeartbeatReturn } from "../hooks/use-agent-heartbeat";
 
 interface AgentOverviewTabProps {
   agent: AgentData;
   onUpdate: (updates: Record<string, unknown>) => Promise<void>;
   heartbeat: UseAgentHeartbeatReturn;
+  onManageCodexPool: () => void;
+  onViewHooks: () => void;
+  onAddHook: () => void;
 }
 
-export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTabProps) {
+export function AgentOverviewTab({ agent, onUpdate, heartbeat, onManageCodexPool, onViewHooks, onAddHook }: AgentOverviewTabProps) {
   const { t } = useTranslation("agents");
 
-  const otherCfg = (agent.other_config ?? {}) as Record<string, unknown>;
-
   // Personality
-  const [emoji, setEmoji] = useState(typeof otherCfg.emoji === "string" ? otherCfg.emoji : "");
+  const [emoji, setEmoji] = useState(agent.emoji ?? "");
   const [displayName, setDisplayName] = useState(agent.display_name ?? "");
   const [frontmatter, setFrontmatter] = useState(agent.frontmatter ?? "");
   const [status, setStatus] = useState(agent.status);
@@ -39,15 +46,16 @@ export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTa
     agent.budget_monthly_cents ? String(agent.budget_monthly_cents / 100) : "",
   );
   // Evolution (predefined only)
-  const [selfEvolve, setSelfEvolve] = useState(Boolean(otherCfg.self_evolve));
-  const [skillEvolve, setSkillEvolve] = useState(Boolean(otherCfg.skill_evolve));
+  const [selfEvolve, setSelfEvolve] = useState(Boolean(agent.self_evolve));
+  const [skillEvolve, setSkillEvolve] = useState(Boolean(agent.skill_evolve));
   const [skillNudgeInterval, setSkillNudgeInterval] = useState(
-    typeof otherCfg.skill_nudge_interval === "number" ? otherCfg.skill_nudge_interval : 15,
+    typeof agent.skill_nudge_interval === "number" ? agent.skill_nudge_interval : 15,
   );
 
-  // Capabilities
-  const [memEnabled, setMemEnabled] = useState(agent.memory_config != null);
+  // Memory (always shown — per-agent overrides, empty = use system defaults)
   const [mem, setMem] = useState<MemoryConfig>(agent.memory_config ?? {});
+
+  // Capabilities (subagents + tool policy)
   const [subEnabled, setSubEnabled] = useState(agent.subagents_config != null);
   const [sub, setSub] = useState<SubagentsConfig>(agent.subagents_config ?? {});
   const [toolsEnabled, setToolsEnabled] = useState(agent.tools_config != null);
@@ -55,24 +63,13 @@ export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTa
 
   // Save state
   const [saving, setSaving] = useState(false);
-  const [saveError, setSaveError] = useState<string | null>(null);
-  const [saved, setSaved] = useState(false);
   const [llmSaveBlocked, setLlmSaveBlocked] = useState(false);
 
   const handleSave = async () => {
     setSaving(true);
-    setSaveError(null);
-    setSaved(false);
     try {
-      const updatedOtherConfig = {
-        ...otherCfg,
-        emoji: emoji.trim() || undefined,
-        self_evolve: selfEvolve,
-        skill_evolve: skillEvolve,
-        skill_nudge_interval: skillEvolve ? skillNudgeInterval : undefined,
-      };
       const budgetCents = budgetDollars ? Math.round(parseFloat(budgetDollars) * 100) : null;
-      await onUpdate({
+      const updates: Record<string, unknown> = {
         display_name: displayName,
         frontmatter: frontmatter || null,
         provider,
@@ -81,18 +78,26 @@ export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTa
         max_tool_iterations: maxToolIterations,
         status,
         is_default: isDefault,
-        other_config: updatedOtherConfig,
         budget_monthly_cents: budgetCents,
-        memory_config: memEnabled ? mem : null,
+        memory_config: mem,
         subagents_config: subEnabled ? sub : null,
         tools_config: toolsEnabled
           ? { profile: tools.profile, allow: tools.allow, deny: tools.deny, alsoAllow: tools.alsoAllow, byProvider: tools.byProvider }
           : {},
-      });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : t("general.failedToSave"));
+        // Promoted fields sent at top level (NOT NULL columns — send "" not null)
+        emoji: emoji.trim(),
+        self_evolve: selfEvolve,
+        skill_evolve: skillEvolve,
+        skill_nudge_interval: skillEvolve ? skillNudgeInterval : 15,
+      };
+      // When the provider changes, clear stale pool routing config so it
+      // doesn't reference members from the previous provider's pool.
+      if (provider !== agent.provider) {
+        updates.chatgpt_oauth_routing = null;
+      }
+      await onUpdate(updates);
+    } catch {
+      // toast shown by hook
     } finally {
       setSaving(false);
     }
@@ -100,6 +105,8 @@ export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTa
 
   return (
     <div className="space-y-4">
+      <PromptSettingsSection agent={agent} onUpdate={onUpdate} />
+
       <PersonalitySection
         agentKey={agent.agent_key}
         emoji={emoji}
@@ -130,12 +137,16 @@ export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTa
         onSaveBlockedChange={setLlmSaveBlocked}
       />
 
-      <HeartbeatCard heartbeat={heartbeat} />
-
-      <SkillsSection agentId={agent.id} />
+      <ChatGPTOAuthRoutingSummarySection agent={agent} onManage={onManageCodexPool} />
+      {provider !== agent.provider && !!agent.chatgpt_oauth_routing && (
+        <p className="text-xs text-amber-600 dark:text-amber-400 -mt-2 px-1">
+          {t("chatgptOAuthRouting.providerChangedWarning")}
+        </p>
+      )}
 
       {agent.agent_type === "predefined" && (
         <EvolutionSection
+          agentId={agent.id}
           selfEvolve={selfEvolve}
           onSelfEvolveChange={setSelfEvolve}
           skillEvolve={skillEvolve}
@@ -145,11 +156,26 @@ export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTa
         />
       )}
 
+      {/* Memory — always visible, per-agent overrides */}
+      <MemorySection
+        value={mem}
+        onChange={setMem}
+      />
+
+      <HeartbeatCard heartbeat={heartbeat} />
+
+      <HooksSummaryCard
+        agentId={agent.id}
+        onViewAll={onViewHooks}
+        onAddHook={onAddHook}
+      />
+
+      <SkillsSection agentId={agent.id} />
+      <PinnedSkillsSection agent={agent} onUpdate={onUpdate} />
+
+      <OrchestrationSection agentId={agent.id} />
+
       <CapabilitiesSection
-        memEnabled={memEnabled}
-        mem={mem}
-        onMemToggle={setMemEnabled}
-        onMemChange={setMem}
         subEnabled={subEnabled}
         sub={sub}
         onSubToggle={setSubEnabled}
@@ -163,12 +189,9 @@ export function AgentOverviewTab({ agent, onUpdate, heartbeat }: AgentOverviewTa
       <StickySaveBar
         onSave={handleSave}
         saving={saving}
-        saved={saved}
-        error={saveError}
         disabled={llmSaveBlocked}
         label={t("general.saveChanges")}
         savingLabel={t("general.saving")}
-        savedLabel={t("general.saved")}
       />
     </div>
   );

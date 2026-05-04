@@ -15,6 +15,7 @@ import (
 	"github.com/nextlevelbuilder/goclaw/internal/channels/media"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/typing"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/zalo/personal/protocol"
+	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
 
@@ -32,6 +33,8 @@ func (c *Channel) handleMessage(msg protocol.Message) {
 }
 
 func (c *Channel) handleDM(msg protocol.UserMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.Data.UIDFrom
 	threadID := msg.ThreadID()
 
@@ -40,7 +43,7 @@ func (c *Channel) handleDM(msg protocol.UserMessage) {
 		return
 	}
 
-	if !c.checkDMPolicy(senderID, threadID) {
+	if !c.checkDMPolicy(ctx, senderID, threadID) {
 		return
 	}
 
@@ -59,14 +62,22 @@ func (c *Channel) handleDM(msg protocol.UserMessage) {
 
 	c.startTyping(threadID, protocol.ThreadTypeUser)
 
+	// Collect contact for DM messages.
+	if cc := c.ContactCollector(); cc != nil {
+		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, "", "direct", "user", "", "")
+	}
+
 	metadata := map[string]string{
-		"message_id": msg.Data.MsgID,
-		"platform":   channels.TypeZaloPersonal,
+		"message_id":   msg.Data.MsgID,
+		"platform":     channels.TypeZaloPersonal,
+		"display_name": channels.SanitizeDisplayName(senderName),
 	}
 	c.HandleMessage(senderID, threadID, content, media, metadata, "direct")
 }
 
 func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
+	ctx := context.Background()
+	ctx = store.WithTenantID(ctx, c.TenantID())
 	senderID := msg.Data.UIDFrom
 	threadID := msg.ThreadID()
 
@@ -76,7 +87,7 @@ func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
 	}
 
 	// Step 1: enforce access policy (allowlist/pairing). Hard reject — don't record history.
-	if !c.checkGroupPolicy(senderID, threadID) {
+	if !c.checkGroupPolicy(ctx, senderID, threadID) {
 		return
 	}
 
@@ -86,21 +97,21 @@ func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
 	}
 
 	// Step 2: @mention gating — record non-mentioned messages in history and return.
-	if c.requireMention {
+	if c.RequireMention() {
 		wasMentioned := c.checkBotMentioned(msg.Data.Mentions)
 		if !wasMentioned {
-			c.groupHistory.Record(threadID, channels.HistoryEntry{
+			c.GroupHistory().Record(threadID, channels.HistoryEntry{
 				Sender:    senderName,
 				SenderID:  senderID,
 				Body:      content,
 				Media:     media,
 				Timestamp: time.Now(),
 				MessageID: msg.Data.MsgID,
-			}, c.historyLimit)
+			}, c.HistoryLimit())
 
 			// Collect contact even when bot is not mentioned (cache prevents DB spam).
 			if cc := c.ContactCollector(); cc != nil {
-				cc.EnsureContact(context.Background(), c.Type(), c.Name(), senderID, senderID, senderName, "", "group")
+				cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, "", "group", "user", "", "")
 			}
 
 			slog.Debug("zalo_personal group message recorded (no mention)",
@@ -120,26 +131,32 @@ func (c *Channel) handleGroupMessage(msg protocol.GroupMessage) {
 	// Step 3: flush pending history + annotate current message with sender name.
 	annotated := fmt.Sprintf("[From: %s]\n%s", senderName, content)
 	finalContent := annotated
-	if c.historyLimit > 0 {
-		finalContent = c.groupHistory.BuildContext(threadID, annotated, c.historyLimit)
+	if c.HistoryLimit() > 0 {
+		finalContent = c.GroupHistory().BuildContext(threadID, annotated, c.HistoryLimit())
 	}
 
 	c.startTyping(threadID, protocol.ThreadTypeGroup)
 
 	// Collect media from pending history entries (images sent before this @mention).
 	// Must come after BuildContext — CollectMedia nulls out Media fields to prevent double-cleanup.
-	histMedia := c.groupHistory.CollectMedia(threadID)
+	histMedia := c.GroupHistory().CollectMedia(threadID)
 	allMedia := append(histMedia, media...)
 
+	// Collect contact for group-mentioned messages.
+	if cc := c.ContactCollector(); cc != nil {
+		cc.EnsureContact(ctx, c.Type(), c.Name(), senderID, senderID, senderName, "", "group", "user", "", "")
+	}
+
 	metadata := map[string]string{
-		"message_id": msg.Data.MsgID,
-		"platform":   channels.TypeZaloPersonal,
-		"group_id":   threadID,
+		"message_id":   msg.Data.MsgID,
+		"platform":     channels.TypeZaloPersonal,
+		"group_id":     threadID,
+		"display_name": channels.SanitizeDisplayName(senderName),
 	}
 	c.HandleMessage(senderID, threadID, finalContent, allMedia, metadata, "group")
 
 	// Clear pending history after sending to agent (matches Telegram/Discord/Slack/Feishu pattern).
-	c.groupHistory.Clear(threadID)
+	c.GroupHistory().Clear(threadID)
 }
 
 // startTyping starts a typing indicator with keepalive for the given thread.

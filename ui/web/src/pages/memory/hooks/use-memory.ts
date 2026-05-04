@@ -39,6 +39,7 @@ export function useMemoryDocuments(filters: MemoryDocFilters) {
       return res ?? [];
     },
     placeholderData: (prev) => prev,
+    staleTime: 60_000,
   });
 
   const documents = data ?? [];
@@ -95,10 +96,15 @@ export function useMemoryDocuments(filters: MemoryDocFilters) {
   );
 
   const deleteDocument = useCallback(
-    async (path: string, userId?: string) => {
+    async (path: string, userId?: string, agentId?: string) => {
+      const aid = agentId || filters.agentId;
+      if (!aid) {
+        toast.error(i18n.t("memory:toast.docDeleteFailed"), "No agent selected");
+        return;
+      }
       try {
         const qs = userId ? `?user_id=${encodeURIComponent(userId)}` : "";
-        await http.delete(`/v1/agents/${filters.agentId}/memory/documents/${path}${qs}`);
+        await http.delete(`/v1/agents/${aid}/memory/documents/${path}${qs}`);
         await invalidate();
         toast.success(i18n.t("memory:toast.docDeleted"), path);
       } catch (err) {

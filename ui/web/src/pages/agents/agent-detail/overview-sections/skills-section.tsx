@@ -32,7 +32,7 @@ export function SkillsSection({ agentId }: SkillsSectionProps) {
       s.description.toLowerCase().includes(search.toLowerCase()),
     )
     .sort((a, b) => {
-      const rank = (s: typeof a) => s.granted ? 0 : s.is_system ? 1 : 2;
+      const rank = (s: typeof a) => s.granted ? 2 : s.is_system ? 1 : 0;
       return rank(a) - rank(b);
     });
 
@@ -77,11 +77,11 @@ export function SkillsSection({ agentId }: SkillsSectionProps) {
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-1.5">
                   <span className="text-sm font-medium truncate">{skill.name}</span>
-                  <Badge variant={visibilityVariant(skill.visibility)} className="text-[10px] shrink-0">
+                  <Badge variant={visibilityVariant(skill.visibility)} className="text-2xs shrink-0">
                     {skill.visibility}
                   </Badge>
                   {skill.is_system && (
-                    <Badge variant="outline" className="border-blue-500 text-blue-600 text-[10px] shrink-0">
+                    <Badge variant="outline" className="border-blue-500 text-blue-600 text-2xs shrink-0">
                       {t("skills.system")}
                     </Badge>
                   )}

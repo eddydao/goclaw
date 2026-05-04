@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log/slog"
 
+	"github.com/nextlevelbuilder/goclaw/internal/edition"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tools"
 )
@@ -12,7 +13,7 @@ import (
 // builtinToolSeedData returns the canonical list of built-in tools to seed into the database.
 // Seed preserves user-customized enabled/settings values across upgrades.
 func builtinToolSeedData() []store.BuiltinToolDef {
-	return []store.BuiltinToolDef{
+	defs := []store.BuiltinToolDef{
 		// filesystem
 		{Name: "read_file", DisplayName: "Read File", Description: "Read the contents of a file from the agent's workspace by path", Category: "filesystem", Enabled: true},
 		{Name: "write_file", DisplayName: "Write File", Description: "Write content to a file in the workspace, creating directories as needed", Category: "filesystem", Enabled: true},
@@ -28,7 +29,9 @@ func builtinToolSeedData() []store.BuiltinToolDef {
 		{Name: "web_search", DisplayName: "Web Search", Description: "Search the web for information using a search engine (Brave or DuckDuckGo)", Category: "web", Enabled: true,
 			Metadata: json.RawMessage(`{"config_hint":"Config → Tools → Web Search"}`),
 		},
-		{Name: "web_fetch", DisplayName: "Web Fetch", Description: "Fetch a web page or API endpoint and extract its text content", Category: "web", Enabled: true},
+		{Name: "web_fetch", DisplayName: "Web Fetch", Description: "Fetch a web page or API endpoint and extract its text content", Category: "web", Enabled: true,
+			Settings: json.RawMessage(`{"extractors":[{"name":"defuddle","enabled":true,"base_url":"https://fetch.goclaw.sh/","max_retries":2},{"name":"html-to-markdown","enabled":true}]}`),
+		},
 
 		// memory
 		{Name: "memory_search", DisplayName: "Memory Search", Description: "Search through the agent's long-term memory using semantic similarity", Category: "memory", Enabled: true,
@@ -42,38 +45,35 @@ func builtinToolSeedData() []store.BuiltinToolDef {
 			Requires: []string{"knowledge_graph"},
 		},
 
-		// media — seed uses chain format: {"providers":[...]}
-		{Name: "read_image", DisplayName: "Read Image", Description: "Analyze images using a vision-capable LLM provider", Category: "media", Enabled: true,
-			Settings: json.RawMessage(`{"providers":[{"provider":"openrouter","model":"google/gemini-2.5-flash-image","enabled":true,"timeout":120,"max_retries":2}]}`),
+		// media — user must configure provider chain via UI before use
+		{Name: "read_image", DisplayName: "Read Image", Description: "Analyze images using a vision-capable LLM provider", Category: "media", Enabled: false,
 			Requires: []string{"vision_provider"},
 		},
-		{Name: "read_document", DisplayName: "Read Document", Description: "Analyze documents (PDF, Word, Excel, PowerPoint, CSV, etc.) using a document-capable LLM provider", Category: "media", Enabled: true,
-			Settings: json.RawMessage(`{"providers":[{"provider":"gemini","model":"gemini-2.5-flash","enabled":true,"timeout":120,"max_retries":2}]}`),
+		{Name: "read_document", DisplayName: "Read Document", Description: "Analyze documents (PDF, Word, Excel, PowerPoint, CSV, etc.) using a document-capable LLM provider", Category: "media", Enabled: false,
 			Requires: []string{"document_provider"},
 		},
-		{Name: "create_image", DisplayName: "Create Image", Description: "Generate images from text prompts using an image generation provider", Category: "media", Enabled: true,
-			Settings: json.RawMessage(`{"providers":[{"provider":"openrouter","model":"google/gemini-2.5-flash-image","enabled":true,"timeout":120,"max_retries":2}]}`),
+		{Name: "create_image", DisplayName: "Create Image", Description: "Generate images from text prompts using an image generation provider", Category: "media", Enabled: false,
 			Requires: []string{"image_gen_provider"},
 		},
-		{Name: "read_audio", DisplayName: "Read Audio", Description: "Analyze audio files (speech, music, sounds) using an audio-capable LLM provider", Category: "media", Enabled: true,
-			Settings: json.RawMessage(`{"providers":[{"provider":"gemini","model":"gemini-2.5-flash","enabled":true,"timeout":120,"max_retries":2}]}`),
+		{Name: "read_audio", DisplayName: "Read Audio", Description: "Analyze audio files (speech, music, sounds) using an audio-capable LLM provider", Category: "media", Enabled: false,
 			Requires: []string{"audio_provider"},
 		},
-		{Name: "read_video", DisplayName: "Read Video", Description: "Analyze video files using a video-capable LLM provider", Category: "media", Enabled: true,
-			Settings: json.RawMessage(`{"providers":[{"provider":"gemini","model":"gemini-2.5-flash","enabled":true,"timeout":120,"max_retries":2}]}`),
+		{Name: "read_video", DisplayName: "Read Video", Description: "Analyze video files using a video-capable LLM provider", Category: "media", Enabled: false,
 			Requires: []string{"video_provider"},
 		},
-		{Name: "create_video", DisplayName: "Create Video", Description: "Generate videos from text descriptions using AI", Category: "media", Enabled: true,
-			Settings: json.RawMessage(`{"providers":[{"provider":"gemini","model":"veo-3.0-generate-preview","enabled":true,"timeout":120,"max_retries":2}]}`),
+		{Name: "create_video", DisplayName: "Create Video", Description: "Generate videos from text descriptions using AI", Category: "media", Enabled: false,
 			Requires: []string{"video_gen_provider"},
 		},
-		{Name: "create_audio", DisplayName: "Create Audio", Description: "Generate music or sound effects from text descriptions using AI", Category: "media", Enabled: true,
-			Settings: json.RawMessage(`{"providers":[{"provider":"minimax","model":"music-2.5+","enabled":true,"timeout":120,"max_retries":2}]}`),
+		{Name: "create_audio", DisplayName: "Create Audio", Description: "Generate music or sound effects from text descriptions using AI", Category: "media", Enabled: false,
 			Requires: []string{"audio_gen_provider"},
 		},
 		{Name: "tts", DisplayName: "Text to Speech", Description: "Convert text to natural-sounding speech audio", Category: "media", Enabled: true,
 			Requires: []string{"tts_provider"},
 			Metadata: json.RawMessage(`{"config_hint":"Config → TTS"}`),
+		},
+		{Name: "stt", DisplayName: "Speech-to-Text", Description: "Transcribe voice/audio messages to text using ElevenLabs Scribe or a proxy service", Category: "media", Enabled: true,
+			Requires: []string{"stt_provider"},
+			Metadata: json.RawMessage(`{"config_hint":"Config → Audio → STT"}`),
 		},
 
 		// browser
@@ -90,6 +90,7 @@ func builtinToolSeedData() []store.BuiltinToolDef {
 
 		// messaging
 		{Name: "message", DisplayName: "Message", Description: "Send a proactive message to a user on a connected channel (Telegram, Discord, etc.)", Category: "messaging", Enabled: true},
+		{Name: "send_file", DisplayName: "Send File", Description: "Send an existing workspace file as an attachment in the current chat (does not create or modify the file)", Category: "messaging", Enabled: true},
 
 		// scheduling
 		{Name: "cron", DisplayName: "Cron Scheduler", Description: "Schedule or manage recurring tasks using cron expressions, at-times, or intervals", Category: "scheduling", Enabled: true,
@@ -111,10 +112,20 @@ func builtinToolSeedData() []store.BuiltinToolDef {
 		{Name: "team_tasks", DisplayName: "Team Tasks", Description: "View, create, update, and complete tasks on the team task board", Category: "teams", Enabled: true,
 			Requires: []string{"managed_mode", "teams"},
 		},
-		{Name: "team_message", DisplayName: "Team Message", Description: "Send a direct message or broadcast to teammates in the agent team", Category: "teams", Enabled: true,
-			Requires: []string{"managed_mode", "teams"},
-		},
 	}
+
+	// Lite edition: remove skill management tools — not available on desktop.
+	if !edition.Current().TeamFullMode {
+		liteHidden := map[string]bool{"skill_manage": true, "publish_skill": true}
+		filtered := defs[:0]
+		for _, d := range defs {
+			if !liteHidden[d.Name] {
+				filtered = append(filtered, d)
+			}
+		}
+		return filtered
+	}
+	return defs
 }
 
 // seedBuiltinTools seeds built-in tool definitions into the database.
@@ -200,6 +211,25 @@ func migrateBuiltinToolSettings(ctx context.Context, bts store.BuiltinToolStore)
 	}
 }
 
+// backfillWebFetchSettings ensures the web_fetch tool has extractor chain settings.
+// Existing deployments may have a web_fetch row with null/empty settings from a prior seed.
+// This backfills the default chain so Defuddle is available out of the box.
+func backfillWebFetchSettings(ctx context.Context, bts store.BuiltinToolStore) {
+	t, err := bts.Get(ctx, "web_fetch")
+	if err != nil || t == nil {
+		return // not seeded yet, will be populated by next seed
+	}
+	if len(t.Settings) > 0 && string(t.Settings) != "{}" && string(t.Settings) != "null" {
+		return // already has settings, don't overwrite
+	}
+	defaultSettings := json.RawMessage(`{"extractors":[{"name":"defuddle","enabled":true,"base_url":"https://fetch.goclaw.sh/","max_retries":2},{"name":"html-to-markdown","enabled":true}]}`)
+	if err := bts.Update(ctx, "web_fetch", map[string]any{"settings": defaultSettings}); err != nil {
+		slog.Warn("builtin_tools: failed to backfill web_fetch settings", "error", err)
+		return
+	}
+	slog.Info("builtin_tools: backfilled web_fetch extractor chain settings")
+}
+
 // applyBuiltinToolDisables unregisters disabled builtin tools from the registry.
 // Called at startup and on cache invalidation.
 func applyBuiltinToolDisables(ctx context.Context, bts store.BuiltinToolStore, toolsReg *tools.Registry) {
@@ -209,14 +239,17 @@ func applyBuiltinToolDisables(ctx context.Context, bts store.BuiltinToolStore, t
 		return
 	}
 
-	var disabled int
+	var disabledCount, enabledCount int
 	for _, t := range all {
 		if !t.Enabled {
-			toolsReg.Unregister(t.Name)
-			disabled++
+			toolsReg.Disable(t.Name)
+			disabledCount++
+		} else {
+			toolsReg.Enable(t.Name)
+			enabledCount++
 		}
 	}
-	if disabled > 0 {
-		slog.Info("builtin tools disabled", "count", disabled)
+	if disabledCount > 0 {
+		slog.Info("builtin tools updated", "disabled", disabledCount, "enabled", enabledCount)
 	}
 }

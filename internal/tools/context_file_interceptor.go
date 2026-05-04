@@ -23,6 +23,7 @@ var protectedFileSet = map[string]bool{
 	bootstrap.AgentsFile:         true,
 	bootstrap.UserFile:           true,
 	bootstrap.UserPredefinedFile: true,
+	bootstrap.CapabilitiesFile:  true,
 }
 
 // contextFileSet is the set of filenames routed to the DB store.
@@ -33,8 +34,9 @@ var contextFileSet = map[string]bool{
 	bootstrap.IdentityFile:       true,
 	bootstrap.UserFile:           true,
 	bootstrap.UserPredefinedFile: true,
-	bootstrap.BootstrapFile:      true, // first-run file (deleted after completion)
-	bootstrap.HeartbeatFile:      true, // agent-level heartbeat checklist
+	bootstrap.BootstrapFile:      true,       // first-run file (deleted after completion)
+	bootstrap.HeartbeatFile:      true,       // agent-level heartbeat checklist
+	bootstrap.CapabilitiesFile:  true,       // domain expertise (evolvable when self_evolve=true)
 }
 
 // isContextFile checks if a path refers to a workspace-root context file.
@@ -78,7 +80,7 @@ type ContextFileInterceptor struct {
 	agentCache       cache.Cache[[]store.AgentContextFileData] // agent-level files, keyed by agentID.String()
 	userCache        cache.Cache[[]store.AgentContextFileData] // user-level files, keyed by "agentID:userID"
 	ttl              time.Duration
-	groupWriterCache *store.GroupWriterCache // nil = use direct DB call (backward compat)
+	permStore store.ConfigPermissionStore // nil = no group write restriction
 }
 
 // NewContextFileInterceptor creates an interceptor backed by the given agent store.
@@ -97,9 +99,9 @@ func NewContextFileInterceptor(
 	}
 }
 
-// SetGroupWriterCache sets the shared cache for group writer permission checks (defense-in-depth).
-func (b *ContextFileInterceptor) SetGroupWriterCache(c *store.GroupWriterCache) {
-	b.groupWriterCache = c
+// SetConfigPermStore sets the config permission store for group writer permission checks.
+func (b *ContextFileInterceptor) SetConfigPermStore(s store.ConfigPermissionStore) {
+	b.permStore = s
 }
 
 // ReadFile attempts to read a context file from the DB (with cache).
@@ -150,11 +152,16 @@ func (b *ContextFileInterceptor) ReadFile(ctx context.Context, path string) (str
 	// Predefined agent: block reads of shared identity files (SOUL.md, IDENTITY.md, AGENTS.md).
 	// These are already injected into the system prompt — allowing read_file would let the
 	// agent echo their full contents to users, leaking persona configuration.
+	// Exception: SOUL.md and CAPABILITIES.md are readable when self_evolve is enabled,
+	// so the agent can inspect current content before making incremental updates.
 	if agentType == store.AgentTypePredefined && fileName != bootstrap.UserFile && fileName != bootstrap.BootstrapFile && fileName != bootstrap.HeartbeatFile {
-		return "", true, fmt.Errorf(
-			"this file (%s) is already loaded into your context. You don't need to read it again — refer to your system instructions instead.",
-			fileName,
-		)
+		allowEvolveRead := (fileName == bootstrap.SoulFile || fileName == bootstrap.CapabilitiesFile) && store.SelfEvolveFromContext(ctx)
+		if !allowEvolveRead {
+			return "", true, fmt.Errorf(
+				"this file (%s) is already loaded into your context. You don't need to read it again — refer to your system instructions instead.",
+				fileName,
+			)
+		}
 	}
 
 	// Default: agent-level
@@ -210,24 +217,18 @@ func (b *ContextFileInterceptor) WriteFile(ctx context.Context, path, content st
 		}
 		if !skipCheck {
 			senderID := store.SenderIDFromContext(ctx)
-			if senderID != "" {
+			if senderID != "" && b.permStore != nil {
 				numericID := strings.SplitN(senderID, "|", 2)[0]
-				var isWriter bool
-				var err error
-				if b.groupWriterCache != nil {
-					isWriter, err = b.groupWriterCache.IsWriter(ctx, agentID, userID, numericID)
-				} else {
-					isWriter, err = b.agentStore.IsGroupFileWriter(ctx, agentID, userID, numericID)
-				}
+				allowed, err := b.permStore.CheckPermission(ctx, agentID, userID, store.ConfigTypeFileWriter, numericID)
 				if err != nil {
 					slog.Warn("security.group_file_writer_check_failed",
 						"error", err, "sender", numericID, "file", fileName, "group", userID)
-					// fail open: allow write if DB check fails
-				} else if !isWriter {
+					// fail open: allow write if check fails
+				} else if !allowed {
 					return true, fmt.Errorf("permission denied: you are not authorized to modify %s in this group. Ask a group file writer to add you with /addwriter", fileName)
 				}
 			}
-			// senderID empty = system context (cron, subagent) → fail open
+			// senderID empty or no permStore = system context (cron, subagent) → fail open
 		}
 	}
 
@@ -243,18 +244,19 @@ func (b *ContextFileInterceptor) WriteFile(ctx context.Context, path, content st
 	}
 
 	// Predefined agent: block writes to shared files (only USER.md + HEARTBEAT.md allowed).
-	// Exception: SOUL.md is allowed when self_evolve is enabled (style/tone evolution).
+	// Exception: SOUL.md and CAPABILITIES.md are allowed when self_evolve is enabled.
 	if agentType == store.AgentTypePredefined && fileName != bootstrap.UserFile && fileName != bootstrap.HeartbeatFile {
-		allowSoulEvolve := fileName == bootstrap.SoulFile && store.SelfEvolveFromContext(ctx)
-		if !allowSoulEvolve {
+		allowEvolve := (fileName == bootstrap.SoulFile || fileName == bootstrap.CapabilitiesFile) && store.SelfEvolveFromContext(ctx)
+		if !allowEvolve {
 			return true, fmt.Errorf(
 				"this file (%s) is part of the agent's predefined configuration and cannot be modified through chat. "+
 					"Only the agent owner can edit it from the management dashboard.",
 				fileName,
 			)
 		}
-		// SOUL.md with self_evolve: write to agent-level (shared across all users)
-		slog.Info("self-evolve: SOUL.md updated",
+		// Self-evolve: write to agent-level (shared across all users)
+		slog.Info("self-evolve: file updated",
+			"file", fileName,
 			"agent_id", agentID,
 			"user_id", userID,
 		)

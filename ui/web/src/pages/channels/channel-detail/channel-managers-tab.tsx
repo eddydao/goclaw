@@ -1,21 +1,16 @@
 import { useState, useEffect, useCallback } from "react";
 import { useTranslation } from "react-i18next";
-import { Plus, Trash2, RefreshCw, Users, ChevronDown, ChevronRight } from "lucide-react";
+import { Trash2, Loader2, RefreshCw, Users, ChevronDown, ChevronRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Combobox } from "@/components/ui/combobox";
 import { EmptyState } from "@/components/shared/empty-state";
-import { useContactPicker } from "@/hooks/use-contact-picker";
 import type { GroupManagerGroupInfo, GroupManagerData } from "../hooks/use-channel-detail";
-import type { ChannelContact } from "@/types/contact";
+import { InlineAddForm } from "./channel-manager-inline-add-form";
 
 interface ChannelManagersTabProps {
   listManagerGroups: () => Promise<GroupManagerGroupInfo[]>;
   listManagers: (groupId: string) => Promise<GroupManagerData[]>;
   addManager: (groupId: string, userId: string, displayName?: string, username?: string) => Promise<void>;
   removeManager: (groupId: string, userId: string) => Promise<void>;
-  listContacts: (search: string, channelType?: string) => Promise<ChannelContact[]>;
 }
 
 /** Strips the "group:<channel>:" prefix for display, e.g. "group:telegram:-100123" → "-100123" */
@@ -24,170 +19,11 @@ function shortGroupId(id: string): string {
   return m?.[1] ?? id;
 }
 
-// --- Inline add form (scoped state per instance) ---
-
-interface InlineAddFormProps {
-  groupId?: string;
-  showGroupField?: boolean;
-  listContacts: (search: string) => Promise<ChannelContact[]>;
-  onAdd: (groupId: string, userId: string, displayName: string, username: string) => Promise<void>;
-}
-
-function InlineAddForm({ groupId, showGroupField, listContacts, onAdd }: InlineAddFormProps) {
-  const { t } = useTranslation("channels");
-  const [formGroupId, setFormGroupId] = useState("");
-  const [userId, setUserId] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [username, setUsername] = useState("");
-  const [adding, setAdding] = useState(false);
-  const [error, setError] = useState("");
-  const { options: contactOptions, searchContacts, getContact, clearOptions } = useContactPicker(listContacts);
-
-  const handleUserIdChange = (val: string) => {
-    setUserId(val);
-    const contact = getContact(val);
-    if (contact) {
-      setDisplayName(contact.display_name ?? "");
-      setUsername(contact.username ?? "");
-    }
-    searchContacts(val);
-  };
-
-  const handleSubmit = async () => {
-    const gid = groupId || formGroupId.trim();
-    const uid = userId.trim();
-    if (!gid || !uid) {
-      setError(t("detail.managers.addForm.errors.groupUserRequired"));
-      return;
-    }
-    setAdding(true);
-    setError("");
-    try {
-      await onAdd(gid, uid, displayName.trim(), username.trim());
-      setUserId("");
-      setDisplayName("");
-      setUsername("");
-      clearOptions();
-      if (!groupId) setFormGroupId("");
-    } catch (err) {
-      setError(err instanceof Error ? err.message : t("detail.managers.addForm.errors.failedAdd"));
-    } finally {
-      setAdding(false);
-    }
-  };
-
-  if (showGroupField) {
-    return (
-      <fieldset className="rounded-md border p-4 space-y-3">
-        <legend className="px-1 text-sm font-medium">{t("detail.managers.addForm.title")}</legend>
-        <p className="text-xs text-muted-foreground">{t("detail.managers.addForm.hint")}</p>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div className="grid gap-1.5">
-            <Label className="text-xs">{t("detail.managers.addForm.groupId")}</Label>
-            <Input
-              value={formGroupId}
-              onChange={(e) => setFormGroupId(e.target.value)}
-              placeholder={t("detail.managers.addForm.groupIdPlaceholder")}
-              className="text-sm"
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label className="text-xs">{t("detail.managers.addForm.userId")}</Label>
-            <Combobox
-              value={userId}
-              onChange={handleUserIdChange}
-              options={contactOptions}
-              placeholder={t("detail.managers.addForm.userIdPlaceholder")}
-              className="text-sm"
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label className="text-xs">{t("detail.managers.addForm.displayName")}</Label>
-            <Input
-              value={displayName}
-              onChange={(e) => setDisplayName(e.target.value)}
-              placeholder={t("detail.managers.addForm.optional")}
-              className="text-sm"
-            />
-          </div>
-          <div className="grid gap-1.5">
-            <Label className="text-xs">{t("detail.managers.addForm.username")}</Label>
-            <Input
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              placeholder={t("detail.managers.addForm.usernameWithout")}
-              className="text-sm"
-            />
-          </div>
-        </div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
-        <div className="flex justify-end">
-          <Button
-            onClick={handleSubmit}
-            disabled={adding || !formGroupId.trim() || !userId.trim()}
-            size="sm"
-            className="gap-1"
-          >
-            <Plus className="h-3.5 w-3.5" />
-            {adding ? t("detail.managers.addForm.adding") : t("detail.managers.addForm.addManager")}
-          </Button>
-        </div>
-      </fieldset>
-    );
-  }
-
-  return (
-    <div className="flex items-end gap-2">
-      <div className="grid gap-1 flex-1">
-        <Label className="text-xs text-muted-foreground">{t("detail.managers.addForm.userId")}</Label>
-        <Combobox
-          value={userId}
-          onChange={handleUserIdChange}
-          options={contactOptions}
-          placeholder={t("detail.managers.addForm.userIdPlaceholder")}
-          className="h-8 text-sm"
-        />
-      </div>
-      <div className="grid gap-1 flex-1">
-        <Label className="text-xs text-muted-foreground">{t("detail.managers.addForm.displayName")}</Label>
-        <Input
-          value={displayName}
-          onChange={(e) => setDisplayName(e.target.value)}
-          placeholder={t("detail.managers.addForm.optional")}
-          className="h-8 text-sm"
-        />
-      </div>
-      <div className="grid gap-1 flex-1">
-        <Label className="text-xs text-muted-foreground">{t("detail.managers.addForm.username")}</Label>
-        <Input
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          placeholder={t("detail.managers.addForm.optional")}
-          className="h-8 text-sm"
-        />
-      </div>
-      <Button
-        size="sm"
-        className="h-8 gap-1 shrink-0"
-        onClick={handleSubmit}
-        disabled={adding || !userId.trim()}
-      >
-        <Plus className="h-3.5 w-3.5" />
-        {t("detail.managers.addForm.add")}
-      </Button>
-      {error && <p className="text-xs text-destructive mt-1">{error}</p>}
-    </div>
-  );
-}
-
-// --- Main tab component ---
-
 export function ChannelManagersTab({
   listManagerGroups,
   listManagers,
   addManager,
   removeManager,
-  listContacts,
 }: ChannelManagersTabProps) {
   const { t } = useTranslation("channels");
   const [groups, setGroups] = useState<GroupManagerGroupInfo[]>([]);
@@ -277,7 +113,10 @@ export function ChannelManagersTab({
             )}
           </h3>
           <Button variant="ghost" size="icon" className="h-7 w-7" onClick={refreshGroups} disabled={loadingGroups}>
-            <RefreshCw className={"h-3.5 w-3.5" + (loadingGroups ? " animate-spin" : "")} />
+            {loadingGroups
+              ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              : <RefreshCw className="h-3.5 w-3.5" />
+            }
           </Button>
         </div>
 
@@ -359,7 +198,6 @@ export function ChannelManagersTab({
 
                       <InlineAddForm
                         groupId={g.group_id}
-                        listContacts={listContacts}
                         onAdd={handleAddManager}
                       />
                     </div>
@@ -374,7 +212,6 @@ export function ChannelManagersTab({
       {/* Add to new group */}
       <InlineAddForm
         showGroupField
-        listContacts={listContacts}
         onAdd={handleAddManager}
       />
     </div>

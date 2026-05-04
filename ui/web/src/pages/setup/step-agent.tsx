@@ -1,7 +1,6 @@
 import { useState, useEffect, useMemo, useCallback } from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
@@ -13,11 +12,9 @@ import { useAgents } from "@/pages/agents/hooks/use-agents";
 import { SummoningModal } from "@/pages/agents/summoning-modal";
 import { useAgentPresets } from "@/pages/agents/agent-presets";
 import { useWsEvent } from "@/hooks/use-ws-event";
-import { slugify, isValidSlug } from "@/lib/slug";
+import { slugify } from "@/lib/slug";
 import type { ProviderData } from "@/types/provider";
 import type { AgentData } from "@/types/agent";
-
-const DEFAULT_PROMPT = `You are GoClaw, my helpful assistant. I am your boss, NextLevelBuilder.`;
 
 interface StepAgentProps {
   provider: ProviderData | null;
@@ -29,19 +26,21 @@ interface StepAgentProps {
 
 export function StepAgent({ provider, model, onComplete, onBack, existingAgent }: StepAgentProps) {
   const { t } = useTranslation("setup");
-  const { createAgent, updateAgent, deleteAgent, resummonAgent } = useAgents();
+  const { createAgent, updateAgent, deleteAgent, resummonAgent, cancelSummonAgent } = useAgents();
   const agentPresets = useAgentPresets();
 
   const isEditing = !!existingAgent;
 
-  const [displayName, setDisplayName] = useState(existingAgent?.display_name ?? "GoClaw");
-  const [agentKey, setAgentKey] = useState(existingAgent?.agent_key ?? "goclaw");
-  const [keyTouched, setKeyTouched] = useState(isEditing);
+  // Default to first preset (Fox Spirit)
+  const defaultPreset = agentPresets[0];
   const [description, setDescription] = useState(
-    existingAgent?.other_config?.description as string ?? DEFAULT_PROMPT,
+    existingAgent?.agent_description ?? defaultPreset?.prompt ?? "",
+  );
+  const [selectedPresetIdx, setSelectedPresetIdx] = useState<number | null>(
+    existingAgent ? null : 0,
   );
   const [selfEvolve, setSelfEvolve] = useState(
-    !!(existingAgent?.other_config?.self_evolve),
+    Boolean(existingAgent?.self_evolve),
   );
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -52,17 +51,31 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
   const [createdAgent, setCreatedAgent] = useState<{ id: string; name: string } | null>(null);
   const [agentResult, setAgentResult] = useState<AgentData | null>(null);
 
-  // Model display (from provider created in step 1)
+  // Derive agent key and display name from selected preset or description
+  const displayName = useMemo(() => {
+    if (existingAgent) return existingAgent.display_name ?? "";
+    if (selectedPresetIdx !== null && agentPresets[selectedPresetIdx]) {
+      return agentPresets[selectedPresetIdx].label;
+    }
+    return "Fox Spirit";
+  }, [existingAgent, selectedPresetIdx, agentPresets]);
+
+  const agentKey = useMemo(() => {
+    const slug = slugify(displayName);
+    return slug || "fox-spirit";
+  }, [displayName]);
+
+  const selectedEmoji = useMemo(() => {
+    if (selectedPresetIdx !== null && agentPresets[selectedPresetIdx]) {
+      return agentPresets[selectedPresetIdx].emoji;
+    }
+    return "🦊";
+  }, [selectedPresetIdx, agentPresets]);
+
   const providerLabel = useMemo(() => {
     if (!provider) return "—";
     return provider.display_name || provider.name;
   }, [provider]);
-
-  useEffect(() => {
-    if (!keyTouched && displayName.trim()) {
-      setAgentKey(slugify(displayName.trim()));
-    }
-  }, [displayName, keyTouched]);
 
   // Track summoning outcome via WS event
   const handleSummoningEvent = useCallback(
@@ -76,42 +89,64 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
   );
   useWsEvent("agent.summoning", handleSummoningEvent);
 
-  // Manual proceed after user sees success state
+  // Sync description when preset changes on initial load
+  useEffect(() => {
+    if (selectedPresetIdx !== null && agentPresets[selectedPresetIdx]) {
+      setDescription(agentPresets[selectedPresetIdx].prompt);
+    }
+  }, [selectedPresetIdx, agentPresets]);
+
   const handleContinue = () => {
     if (agentResult) onComplete(agentResult);
   };
 
+  const handleSelectPreset = (idx: number) => {
+    const preset = agentPresets[idx];
+    if (!preset) return;
+    setSelectedPresetIdx(idx);
+    setDescription(preset.prompt);
+  };
+
+  const handleDescriptionChange = (value: string) => {
+    setDescription(value);
+    // If user edits text, deselect preset (unless it still matches)
+    if (selectedPresetIdx !== null) {
+      const presetPrompt = agentPresets[selectedPresetIdx]?.prompt;
+      if (value !== presetPrompt) setSelectedPresetIdx(null);
+    }
+  };
+
   const handleSubmit = async () => {
-    if (!agentKey.trim() || !isValidSlug(agentKey)) return;
     if (!provider) { setError(t("agent.errors.noProvider")); return; }
 
     setLoading(true);
     setError("");
 
     try {
-      const otherConfig: Record<string, unknown> = {};
-      if (description.trim()) otherConfig.description = description.trim();
-      if (selfEvolve) otherConfig.self_evolve = true;
-
       if (isEditing) {
-        // Update existing agent — skip summoning
         const patch: Partial<AgentData> = {
           display_name: displayName.trim() || undefined,
           provider: provider.name,
           model: model || "",
-          other_config: Object.keys(otherConfig).length > 0 ? otherConfig : undefined,
+          // Promoted fields at top level
+          agent_description: description.trim() || null,
+          self_evolve: selfEvolve,
+          emoji: selectedEmoji || null,
         };
         await updateAgent(existingAgent!.id, patch);
         onComplete({ ...existingAgent!, ...patch } as AgentData);
       } else {
         const data: Partial<AgentData> = {
-          agent_key: agentKey.trim(),
+          agent_key: agentKey,
           display_name: displayName.trim() || undefined,
           provider: provider.name,
           model: model || "",
           agent_type: "predefined",
           is_default: true,
-          other_config: Object.keys(otherConfig).length > 0 ? otherConfig : undefined,
+          // Promoted fields at top level
+          agent_description: description.trim() || null,
+          self_evolve: selfEvolve,
+          emoji: selectedEmoji || null,
         };
 
         const result = await createAgent(data) as AgentData;
@@ -127,15 +162,12 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
     }
   };
 
-  // Called by SummoningModal on both success/failure — we ignore it, use WS outcome instead
   const handleSummoningComplete = () => {};
 
-  // Close modal: only allowed after summoning finishes
   const handleModalClose = async () => {
-    if (summoningOutcome === "pending") return; // block while summoning
-    if (summoningOutcome === "success") return; // auto-proceed handles this
+    if (summoningOutcome === "pending") return;
+    if (summoningOutcome === "success") return;
 
-    // Failed: delete agent and reset form
     if (agentResult) {
       try { await deleteAgent(agentResult.id); } catch { /* best effort */ }
     }
@@ -148,8 +180,8 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
 
   return (
     <>
-      <Card>
-        <CardContent className="space-y-4 pt-6">
+      <Card className="py-0 gap-0">
+        <CardContent className="space-y-4 px-6 py-5">
           <TooltipProvider>
             <div className="space-y-1">
               <h2 className="text-lg font-semibold">{t("agent.title")}</h2>
@@ -172,46 +204,23 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
               )}
             </div>
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label className="inline-flex items-center gap-1.5">
-                  {t("agent.displayName")}
-                  <InfoTip text={t("agent.displayNameHint")} />
-                </Label>
-                <Input
-                  value={displayName}
-                  onChange={(e) => setDisplayName(e.target.value)}
-                  placeholder={t("agent.displayNamePlaceholder", "e.g. GoClaw")}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label className="inline-flex items-center gap-1.5">
-                  {t("agent.agentKey")}
-                  <InfoTip text={t("agent.agentKeyHint")} />
-                </Label>
-                <Input
-                  value={agentKey}
-                  onChange={(e) => { setKeyTouched(true); setAgentKey(e.target.value); }}
-                  onBlur={() => setAgentKey(slugify(agentKey))}
-                  placeholder={t("agent.agentKeyPlaceholder")}
-                  disabled={isEditing}
-                />
-              </div>
-            </div>
-
-            {/* Prompt / description */}
+            {/* Prompt / description with preset selection */}
             <div className="space-y-3">
               <Label className="inline-flex items-center gap-1.5">
                 {t("agent.personality")}
                 <InfoTip text={t("agent.personalityHint")} />
               </Label>
               <div className="flex flex-wrap gap-1.5">
-                {agentPresets.map((preset) => (
+                {agentPresets.map((preset, idx) => (
                   <button
                     key={preset.label}
                     type="button"
-                    onClick={() => setDescription(preset.prompt)}
-                    className="cursor-pointer rounded-full border px-2.5 py-0.5 text-xs transition-colors hover:bg-accent"
+                    onClick={() => handleSelectPreset(idx)}
+                    className={`cursor-pointer rounded-full border px-2.5 py-0.5 text-xs transition-colors ${
+                      selectedPresetIdx === idx
+                        ? "border-primary bg-primary/10 text-primary font-medium"
+                        : "hover:bg-accent"
+                    }`}
                   >
                     {preset.label}
                   </button>
@@ -219,7 +228,7 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
               </div>
               <Textarea
                 value={description}
-                onChange={(e) => setDescription(e.target.value)}
+                onChange={(e) => handleDescriptionChange(e.target.value)}
                 placeholder={t("agent.personalityPlaceholder")}
                 className="min-h-[120px]"
               />
@@ -245,7 +254,7 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
               )}
               <Button
                 onClick={handleSubmit}
-                disabled={loading || !agentKey.trim() || !isValidSlug(agentKey) || !description.trim()}
+                disabled={loading || !description.trim()}
               >
                 {loading
                   ? isEditing ? t("agent.updating", "Updating...") : t("agent.creating")
@@ -265,6 +274,7 @@ export function StepAgent({ provider, model, onComplete, onBack, existingAgent }
           agentName={createdAgent.name}
           onCompleted={handleSummoningComplete}
           onResummon={resummonAgent}
+          onCancel={cancelSummonAgent}
           hideClose
           onContinue={summoningOutcome === "success" ? handleContinue : undefined}
         />

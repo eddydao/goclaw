@@ -96,6 +96,7 @@ func DefaultConfig() Config {
 		ReadOnlyRoot:     true,
 		CapDrop:          []string{"ALL"},
 		Tmpfs:            []string{"/tmp", "/var/tmp", "/run"},
+		PidsLimit:        256,
 		MaxOutputBytes:   1 << 20, // 1MB
 		ContainerPrefix:  "goclaw-sbx-",
 		Workdir:          "/workspace",
@@ -117,12 +118,16 @@ func (c Config) ShouldSandbox(agentID string) bool {
 	}
 }
 
+// DefaultContainerWorkdir is the default container-side working directory
+// used when no custom Workdir is configured.
+const DefaultContainerWorkdir = "/workspace"
+
 // ContainerWorkdir returns the container-side working directory.
 func (c Config) ContainerWorkdir() string {
 	if c.Workdir != "" {
 		return c.Workdir
 	}
-	return "/workspace"
+	return DefaultContainerWorkdir
 }
 
 // ResolveScopeKey maps a session key to a sandbox scope key.

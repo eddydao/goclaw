@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -25,13 +26,15 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 		elapsed := time.Since(time.UnixMilli(task.CreatedAt))
 
 		item := AnnounceQueueItem{
-			SubagentID: task.ID,
-			Label:      task.Label,
-			Status:     task.Status,
-			Result:     task.Result,
-			Media:      task.Media,
-			Runtime:    elapsed,
-			Iterations: iterations,
+			SubagentID:   task.ID,
+			Label:        task.Label,
+			Status:       task.Status,
+			Result:       task.Result,
+			Media:        task.Media,
+			Runtime:      elapsed,
+			Iterations:   iterations,
+			InputTokens:  task.TotalInputTokens,
+			OutputTokens: task.TotalOutputTokens,
 		}
 		meta := AnnounceMetadata{
 			OriginChannel:    task.OriginChannel,
@@ -39,7 +42,10 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 			OriginPeerKind:   task.OriginPeerKind,
 			OriginLocalKey:   task.OriginLocalKey,
 			OriginUserID:     task.OriginUserID,
+			OriginSenderID:   task.OriginSenderID,
+			OriginRole:       task.OriginRole,
 			OriginSessionKey: task.OriginSessionKey,
+			OriginTenantID:   task.OriginTenantID,
 			ParentAgent:      task.ParentID,
 			OriginTraceID:    task.OriginTraceID.String(),
 			OriginRootSpanID: task.OriginRootSpanID.String(),
@@ -51,23 +57,38 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 			sm.announceQueue.Enqueue(sessionKey, item, meta)
 		} else {
 			// Direct publish (no batching)
-			remainingActive := sm.CountRunningForParent(task.ParentID)
-			announceContent := FormatBatchedAnnounce([]AnnounceQueueItem{item}, remainingActive)
+			roster := sm.RosterForParent(task.ParentID)
+			announceContent := FormatBatchedAnnounce([]AnnounceQueueItem{item}, roster)
 
 			announceMeta := map[string]string{
-				"origin_channel":      task.OriginChannel,
-				"origin_peer_kind":    task.OriginPeerKind,
-				"parent_agent":        task.ParentID,
-				"subagent_id":         task.ID,
-				"subagent_label":      task.Label,
-				"origin_trace_id":     task.OriginTraceID.String(),
-				"origin_root_span_id": task.OriginRootSpanID.String(),
+				MetaOriginChannel:      task.OriginChannel,
+				MetaOriginPeerKind:     task.OriginPeerKind,
+				MetaParentAgent:        task.ParentID,
+				"subagent_id":          task.ID,
+				MetaSubagentLabel:      task.Label,
+				MetaSubagentStatus:     task.Status,
+				MetaSubagentResult:     task.Result,
+				MetaSubagentRuntime:    fmt.Sprintf("%d", elapsed.Milliseconds()),
+				MetaSubagentIterations: fmt.Sprintf("%d", iterations),
+				MetaSubagentInputToks:  fmt.Sprintf("%d", task.TotalInputTokens),
+				MetaSubagentOutputToks: fmt.Sprintf("%d", task.TotalOutputTokens),
+				MetaOriginTraceID:      task.OriginTraceID.String(),
+				MetaOriginRootSpanID:   task.OriginRootSpanID.String(),
 			}
 			if task.OriginLocalKey != "" {
-				announceMeta["origin_local_key"] = task.OriginLocalKey
+				announceMeta[MetaOriginLocalKey] = task.OriginLocalKey
 			}
 			if task.OriginSessionKey != "" {
-				announceMeta["origin_session_key"] = task.OriginSessionKey
+				announceMeta[MetaOriginSessionKey] = task.OriginSessionKey
+			}
+			if task.OriginSenderID != "" {
+				announceMeta[MetaOriginSenderID] = task.OriginSenderID
+			}
+			if task.OriginRole != "" {
+				announceMeta[MetaOriginRole] = task.OriginRole
+			}
+			if task.OriginUserID != "" {
+				announceMeta[MetaOriginUserID] = task.OriginUserID
 			}
 			sm.msgBus.PublishInbound(bus.InboundMessage{
 				Channel:  "system",
@@ -75,6 +96,7 @@ func (sm *SubagentManager) runTask(ctx context.Context, task *SubagentTask, call
 				ChatID:   task.OriginChatID,
 				Content:  announceContent,
 				UserID:   task.OriginUserID,
+				TenantID: task.OriginTenantID,
 				Metadata: announceMeta,
 				Media:    task.Media,
 			})
@@ -161,8 +183,20 @@ func (sm *SubagentManager) executeTask(ctx context.Context, task *SubagentTask) 
 		model = task.Model
 	}
 
+	// Determine provider (cascading priority):
+	// 1. Parent agent's provider (inherit so model/provider combo stays valid)
+	// 2. SubagentManager default provider (system-wide fallback)
+	activeProvider := sm.provider
+	if sm.providerReg != nil {
+		if parentProviderName := ParentProviderFromCtx(ctx); parentProviderName != "" {
+			if p, err := sm.providerReg.Get(ctx, parentProviderName); err == nil {
+				activeProvider = p
+			}
+		}
+	}
+
 	// Emit running subagent root span (after model resolution so span has correct model).
-	sm.emitSubagentSpanStart(traceCtx, subRootSpanID, taskStart, task, model)
+	sm.emitSubagentSpanStart(traceCtx, subRootSpanID, taskStart, task, model, activeProvider.Name())
 
 	// Build subagent system prompt (matching TS buildSubagentSystemPrompt pattern).
 	workspace := ToolWorkspaceFromCtx(ctx)
@@ -199,9 +233,44 @@ func (sm *SubagentManager) executeTask(ctx context.Context, task *SubagentTask) 
 		}
 
 		llmStart := time.Now().UTC()
-		llmSpanID := sm.emitLLMSpanStart(subTraceCtx, llmStart, iteration, model, messages)
-		resp, err := sm.provider.Chat(ctx, chatReq)
+		llmSpanID := sm.emitLLMSpanStart(subTraceCtx, llmStart, iteration, model, activeProvider.Name(), messages)
+
+		maxRetries := task.spawnConfig.MaxRetries
+		if maxRetries <= 0 {
+			maxRetries = 2
+		}
+		var resp *providers.ChatResponse
+		var err error
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			if attempt > 0 {
+				backoff := time.Duration(attempt) * 2 * time.Second
+				select {
+				case <-ctx.Done():
+				case <-time.After(backoff):
+				}
+				if ctx.Err() != nil {
+					break
+				}
+				slog.Info("subagent LLM retry", "id", task.ID, "iteration", iteration, "attempt", attempt+1)
+			}
+		// ctx is the parent agent's run context — cancelling the parent (e.g. agent abort)
+		// cascades here and to all subsequent tool calls in this iteration.
+		// Do NOT replace ctx with context.Background() here; that would detach abort propagation.
+			resp, err = activeProvider.Chat(ctx, chatReq)
+			if err == nil {
+				break
+			}
+		}
+
 		sm.emitLLMSpanEnd(subTraceCtx, llmSpanID, llmStart, resp, err)
+
+		// Accumulate token usage for cost tracking.
+		if resp != nil && resp.Usage != nil {
+			sm.mu.Lock()
+			task.TotalInputTokens += int64(resp.Usage.PromptTokens)
+			task.TotalOutputTokens += int64(resp.Usage.CompletionTokens)
+			sm.mu.Unlock()
+		}
 
 		if err != nil {
 			sm.mu.Lock()
@@ -209,6 +278,7 @@ func (sm *SubagentManager) executeTask(ctx context.Context, task *SubagentTask) 
 			task.Result = fmt.Sprintf("LLM error at iteration %d: %v", iteration, err)
 			sm.mu.Unlock()
 			slog.Warn("subagent LLM error", "id", task.ID, "iteration", iteration, "error", err)
+			go sm.persistStatus(ctx, task, iteration)
 			return iteration
 		}
 
@@ -246,7 +316,7 @@ func (sm *SubagentManager) executeTask(ctx context.Context, task *SubagentTask) 
 					p = strings.TrimSpace(p[:nl])
 				}
 				if p != "" {
-					mediaFiles = append(mediaFiles, bus.MediaFile{Path: p})
+					mediaFiles = append(mediaFiles, bus.MediaFile{Path: p, Filename: filepath.Base(p)})
 				}
 			}
 
@@ -268,5 +338,9 @@ func (sm *SubagentManager) executeTask(ctx context.Context, task *SubagentTask) 
 	sm.mu.Unlock()
 
 	slog.Info("subagent completed", "id", task.ID, "iterations", iteration)
+
+	// Persist final status to DB (fire-and-forget).
+	go sm.persistStatus(ctx, task, iteration)
+
 	return iteration
 }

@@ -6,8 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
-	"syscall"
 
 	"github.com/nextlevelbuilder/goclaw/internal/bootstrap"
 	"github.com/nextlevelbuilder/goclaw/internal/sandbox"
@@ -30,7 +30,8 @@ type ReadFileTool struct {
 	sandboxMgr       sandbox.Manager         // nil = direct host access
 	contextFileIntc  *ContextFileInterceptor // nil = no virtual FS routing
 	memIntc          *MemoryInterceptor      // nil = no memory routing
-	groupWriterCache *store.GroupWriterCache // nil = no group read restriction
+	permStore        store.ConfigPermissionStore // nil = no group read restriction
+	vaultIntc        *VaultInterceptor           // nil = no vault lazy sync
 }
 
 // SetContextFileInterceptor enables virtual FS routing for context files.
@@ -43,9 +44,14 @@ func (t *ReadFileTool) SetMemoryInterceptor(intc *MemoryInterceptor) {
 	t.memIntc = intc
 }
 
-// SetGroupWriterCache enables group read restriction for SOUL.md/AGENTS.md.
-func (t *ReadFileTool) SetGroupWriterCache(c *store.GroupWriterCache) {
-	t.groupWriterCache = c
+// SetConfigPermStore enables group read restriction for SOUL.md/AGENTS.md.
+func (t *ReadFileTool) SetConfigPermStore(s store.ConfigPermissionStore) {
+	t.permStore = s
+}
+
+// SetVaultInterceptor enables lazy vault hash sync on file reads.
+func (t *ReadFileTool) SetVaultInterceptor(v *VaultInterceptor) {
+	t.vaultIntc = v
 }
 
 func NewReadFileTool(workspace string, restrict bool) *ReadFileTool {
@@ -70,8 +76,10 @@ func NewSandboxedReadFileTool(workspace string, restrict bool, mgr sandbox.Manag
 // SetSandboxKey is a no-op; sandbox key is now read from ctx (thread-safe).
 func (t *ReadFileTool) SetSandboxKey(key string) {}
 
-func (t *ReadFileTool) Name() string        { return "read_file" }
-func (t *ReadFileTool) Description() string { return "Read the contents of a file" }
+func (t *ReadFileTool) Name() string { return "read_file" }
+func (t *ReadFileTool) Description() string {
+	return "Read the contents of a file. For large files, use offset and limit to read specific line ranges."
+}
 func (t *ReadFileTool) Parameters() map[string]any {
 	return map[string]any{
 		"type": "object",
@@ -79,6 +87,14 @@ func (t *ReadFileTool) Parameters() map[string]any {
 			"path": map[string]any{
 				"type":        "string",
 				"description": "File path (relative to workspace, or absolute)",
+			},
+			"offset": map[string]any{
+				"type":        "integer",
+				"description": "Start reading from this line number (0-indexed). Defaults to 0.",
+			},
+			"limit": map[string]any{
+				"type":        "integer",
+				"description": "Maximum number of lines to return. Omit to read until output cap.",
 			},
 		},
 		"required": []string{"path"},
@@ -92,10 +108,10 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 	}
 
 	// Group read restriction: block non-writers from reading SOUL.md/AGENTS.md
-	if t.groupWriterCache != nil {
+	if t.permStore != nil {
 		base := filepath.Base(path)
 		if base == bootstrap.SoulFile || base == bootstrap.AgentsFile {
-			if err := store.CheckGroupWritePermission(ctx, t.groupWriterCache); err != nil {
+			if err := store.CheckFileWriterPermission(ctx, t.permStore); err != nil {
 				return ErrorResult(fmt.Sprintf("permission denied: %s is restricted in this group", base))
 			}
 		}
@@ -130,14 +146,14 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 			if content == "" {
 				return SilentResult(fmt.Sprintf("(memory file %s does not exist yet — it will be created when memory is saved)", path))
 			}
-			return SilentResult(content)
+			return SilentResult(content + "\n\n[Source: database, not filesystem]")
 		}
 	}
 
 	// Sandbox routing (sandboxKey from ctx — thread-safe)
 	sandboxKey := ToolSandboxKeyFromCtx(ctx)
 	if t.sandboxMgr != nil && sandboxKey != "" {
-		return t.executeInSandbox(ctx, path, sandboxKey)
+		return t.executeInSandbox(ctx, path, sandboxKey, args)
 	}
 
 	// Host execution — use per-user workspace from context if available
@@ -154,6 +170,17 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 		return ErrorResult(err.Error())
 	}
 
+	// Block binary files — reading them wastes context with garbled data.
+	if isBinaryFileExt(resolved) {
+		ext := strings.ToLower(filepath.Ext(resolved))
+		return ErrorResult(fmt.Sprintf("cannot read binary file (%s). Use the appropriate tool: read_image for images, read_document for documents, read_audio for audio, read_video for video.", ext))
+	}
+
+	// Vault lazy sync: update hash if file was modified outside the agent.
+	if t.vaultIntc != nil {
+		go t.vaultIntc.BeforeRead(context.WithoutCancel(ctx), resolved)
+	}
+
 	data, err := os.ReadFile(resolved)
 	if err != nil {
 		msg := fmt.Sprintf("failed to read file: %v", err)
@@ -165,21 +192,27 @@ func (t *ReadFileTool) Execute(ctx context.Context, args map[string]any) *Result
 		return ErrorResult(msg)
 	}
 
-	return SilentResult(string(data))
+	return t.paginateOutput(string(data), args)
 }
 
-func (t *ReadFileTool) executeInSandbox(ctx context.Context, path, sandboxKey string) *Result {
+func (t *ReadFileTool) executeInSandbox(ctx context.Context, path, sandboxKey string, args map[string]any) *Result {
 	bridge, err := t.getFsBridge(ctx, sandboxKey)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("sandbox error: %v", err))
 	}
 
-	data, err := bridge.ReadFile(ctx, path)
+	containerCwd, cwdErr := SandboxCwd(ctx, t.workspace, sandbox.DefaultContainerWorkdir)
+	if cwdErr != nil {
+		return ErrorResult(fmt.Sprintf("sandbox path mapping: %v", cwdErr))
+	}
+	containerPath := ResolveSandboxPath(path, containerCwd)
+
+	data, err := bridge.ReadFile(ctx, containerPath)
 	if err != nil {
-		return ErrorResult(fmt.Sprintf("failed to read file: %v", err))
+		return ErrorResult(fmt.Sprintf("failed to read file: %v", err) + MaybeFsBridgeHint(err))
 	}
 
-	return SilentResult(data)
+	return t.paginateOutput(data, args)
 }
 
 func (t *ReadFileTool) getFsBridge(ctx context.Context, sandboxKey string) (*sandbox.FsBridge, error) {
@@ -187,19 +220,147 @@ func (t *ReadFileTool) getFsBridge(ctx context.Context, sandboxKey string) (*san
 	if err != nil {
 		return nil, err
 	}
-	return sandbox.NewFsBridge(sb.ID(), "/workspace"), nil
+	return sandbox.NewFsBridge(sb.ID(), sandbox.DefaultContainerWorkdir), nil
 }
 
-// allowedWithTeamWorkspace returns the allowed prefixes with team workspace appended
-// if present in context. Thread-safe: creates a new slice per request.
+// readFileMaxChars is the output cap for read_file. Large files require offset/limit pagination.
+const readFileMaxChars = 50000
+
+// paginateOutput applies offset/limit slicing and output capping to file content.
+// Returns a SilentResult with pagination metadata when the output is truncated.
+func (t *ReadFileTool) paginateOutput(content string, args map[string]any) *Result {
+	lines := strings.Split(content, "\n")
+	totalLines := len(lines)
+
+	// Parse offset (0-indexed line number).
+	offset := 0
+	if v, ok := args["offset"]; ok {
+		switch n := v.(type) {
+		case float64:
+			offset = int(n)
+		case int:
+			offset = n
+		}
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= totalLines {
+		return SilentResult(fmt.Sprintf("(offset %d exceeds file length of %d lines)", offset, totalLines))
+	}
+
+	// Parse limit (max lines to return).
+	limit := 0 // 0 = no explicit limit
+	if v, ok := args["limit"]; ok {
+		switch n := v.(type) {
+		case float64:
+			limit = int(n)
+		case int:
+			limit = n
+		}
+	}
+
+	// Slice lines by offset and limit.
+	sliced := lines[offset:]
+	if limit > 0 && limit < len(sliced) {
+		sliced = sliced[:limit]
+	}
+
+	output := strings.Join(sliced, "\n")
+	shownLines := len(sliced)
+	endLine := offset + shownLines
+
+	// Check output char cap.
+	runeCount := len([]rune(output))
+	if runeCount <= readFileMaxChars {
+		// Fits within cap — add line info if offset was used or file was partially read.
+		if offset > 0 || endLine < totalLines {
+			output += fmt.Sprintf("\n\n[Showing lines %d-%d of %d total]", offset, endLine-1, totalLines)
+		}
+		return SilentResult(output)
+	}
+
+	// Output exceeds cap — truncate at line boundary within budget.
+	charCount := 0
+	truncIdx := len(sliced)
+	for i, line := range sliced {
+		charCount += len([]rune(line)) + 1 // +1 for newline
+		if charCount > readFileMaxChars {
+			truncIdx = i
+			break
+		}
+	}
+	if truncIdx < 1 {
+		truncIdx = 1
+	}
+
+	output = strings.Join(sliced[:truncIdx], "\n")
+	shownLines = truncIdx
+	nextOffset := offset + shownLines
+
+	output += fmt.Sprintf("\n\n[Output capped. File has %d lines, showed %d (lines %d-%d). Use offset=%d to continue reading.]",
+		totalLines, shownLines, offset, offset+shownLines-1, nextOffset)
+
+	return SilentResult(output)
+}
+
+// allowedWithTeamWorkspace returns the READ-allowed prefixes with team workspace,
+// team root, and tenant-specific paths appended if present in context.
+// Thread-safe: creates a new slice per request.
+// Merge order: base (global) → tenant paths → team workspace (leaf scope) → team root.
+// Team root is the team-wide directory without UserChatLayer suffix; it lets
+// any agent in the team read files generated by peers under different chat scopes.
+//
+// Use this variant for read operations (read_file, read_image, list_files, send_file).
+// For write operations, use allowedWriteWithTeamWorkspace instead — team root is
+// intentionally excluded from write to prevent cross-chat write leakage.
 func allowedWithTeamWorkspace(ctx context.Context, base []string) []string {
+	return buildAllowedPrefixes(ctx, base, true)
+}
+
+// allowedWriteWithTeamWorkspace returns the WRITE-allowed prefixes. Same as the
+// read variant but WITHOUT team root — writes must stay within the agent's leaf
+// scope (team workspace = own chat dir for isolated mode, team root itself for
+// shared mode). This prevents an agent in chat A from writing into chat B's
+// workspace through a cross-chat absolute path.
+//
+// Use this variant for write/mutation operations (write_file, edit, shell).
+func allowedWriteWithTeamWorkspace(ctx context.Context, base []string) []string {
+	return buildAllowedPrefixes(ctx, base, false)
+}
+
+// buildAllowedPrefixes merges base + tenant paths + team workspace, optionally
+// including team root. Extracted to share the slice-building logic between read
+// and write variants without duplication.
+func buildAllowedPrefixes(ctx context.Context, base []string, includeTeamRoot bool) []string {
+	tenantPaths := TenantAllowedPathsFromCtx(ctx)
 	teamWs := ToolTeamWorkspaceFromCtx(ctx)
-	if teamWs == "" {
+	var teamRoot string
+	if includeTeamRoot {
+		teamRoot = ToolTeamRootFromCtx(ctx)
+	}
+
+	if len(tenantPaths) == 0 && teamWs == "" && teamRoot == "" {
 		return base
 	}
-	out := make([]string, len(base)+1)
-	copy(out, base)
-	out[len(base)] = teamWs
+
+	capacity := len(base) + len(tenantPaths)
+	if teamWs != "" {
+		capacity++
+	}
+	if teamRoot != "" && teamRoot != teamWs {
+		capacity++
+	}
+
+	out := make([]string, 0, capacity)
+	out = append(out, base...)
+	out = append(out, tenantPaths...)
+	if teamWs != "" {
+		out = append(out, teamWs)
+	}
+	if teamRoot != "" && teamRoot != teamWs {
+		out = append(out, teamRoot)
+	}
 	return out
 }
 
@@ -258,6 +419,29 @@ func checkDeniedPath(resolved, workspace string, deniedPrefixes []string) error 
 		}
 	}
 	return nil
+}
+
+// binaryFileExts are file extensions that should not be read as text.
+// Reading these wastes context with garbled binary data.
+var binaryFileExts = map[string]bool{
+	// Images
+	".jpg": true, ".jpeg": true, ".png": true, ".gif": true, ".webp": true,
+	".bmp": true, ".ico": true, ".tiff": true, ".tif": true,
+	// Audio
+	".mp3": true, ".wav": true, ".ogg": true, ".flac": true, ".aac": true, ".m4a": true,
+	// Video
+	".mp4": true, ".avi": true, ".mov": true, ".mkv": true, ".webm": true,
+	// Archives
+	".zip": true, ".tar": true, ".gz": true, ".bz2": true, ".7z": true, ".rar": true,
+	// Documents (binary)
+	".pdf": true, ".docx": true, ".xlsx": true, ".pptx": true,
+	// Executables
+	".exe": true, ".dll": true, ".so": true, ".dylib": true,
+}
+
+// isBinaryFileExt returns true if the file extension indicates a binary file.
+func isBinaryFileExt(path string) bool {
+	return binaryFileExts[strings.ToLower(filepath.Ext(path))]
 }
 
 // resolvePath resolves a path relative to the workspace and validates it.
@@ -352,7 +536,13 @@ func resolvePath(path, workspace string, restrict bool) (string, error) {
 }
 
 // isPathInside checks whether child is inside or equal to parent directory.
+// On Windows, comparison is case-insensitive since NTFS paths are case-insensitive.
 func isPathInside(child, parent string) bool {
+	// Windows paths are case-insensitive; normalize to lowercase for comparison.
+	if runtime.GOOS == "windows" {
+		child = strings.ToLower(child)
+		parent = strings.ToLower(parent)
+	}
 	if child == parent {
 		return true
 	}
@@ -393,49 +583,3 @@ func resolveThroughExistingAncestors(target string) (string, error) {
 	return filepath.Clean(target), nil
 }
 
-// hasMutableSymlinkParent checks if any component of the resolved path is a symlink
-// whose parent directory is writable by the current process. A writable parent means
-// the symlink could be replaced between path resolution and actual file operation
-// (TOCTOU symlink rebind attack).
-func hasMutableSymlinkParent(path string) bool {
-	clean := filepath.Clean(path)
-	components := strings.Split(clean, string(filepath.Separator))
-	current := string(filepath.Separator)
-	for _, comp := range components {
-		if comp == "" {
-			continue
-		}
-		current = filepath.Join(current, comp)
-		info, err := os.Lstat(current)
-		if err != nil {
-			break // non-existent — stop checking
-		}
-		if info.Mode()&os.ModeSymlink != 0 {
-			// Symlink found — check if its parent dir is writable
-			parentDir := filepath.Dir(current)
-			if syscall.Access(parentDir, 0x2 /* W_OK */) == nil {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// checkHardlink rejects regular files with nlink > 1 (hardlink attack prevention).
-// Directories naturally have nlink > 1 and are exempt.
-func checkHardlink(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil // non-existent files are OK — will fail at read/write
-	}
-	if info.IsDir() {
-		return nil
-	}
-	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		if stat.Nlink > 1 {
-			slog.Warn("security.hardlink_rejected", "path", path, "nlink", stat.Nlink)
-			return fmt.Errorf("access denied: hardlinked file not allowed")
-		}
-	}
-	return nil
-}

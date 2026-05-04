@@ -1,12 +1,16 @@
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { ArrowLeft, Bot, Heart, Settings, Sparkles, Star, Trash2 } from "lucide-react";
+import { ArrowLeft, Bot, Eye, Heart, Settings, Sparkles, Star, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { AgentData } from "@/types/agent";
 import type { HeartbeatConfig } from "@/pages/agents/hooks/use-agent-heartbeat";
 import { useCountdown } from "@/hooks/use-countdown";
-import { agentDisplayName, agentKeyDisplay } from "./agent-display-utils";
+import { agentDisplayName, agentKeyDisplay, hasActiveChatGPTOAuthRouting, readPromptMode } from "./agent-display-utils";
+import { cn } from "@/lib/utils";
+import { promptModeBadgeClass } from "./prompt-mode-badge-utils";
+import { V3CapabilitiesModal } from "@/components/agents/v3-capabilities-modal/v3-capabilities-modal";
 
 interface AgentHeaderProps {
   agent: AgentData;
@@ -15,16 +19,19 @@ interface AgentHeaderProps {
   onDelete: () => void;
   onAdvanced: () => void;
   onHeartbeat: () => void;
+  onSystemPrompt?: () => void;
 }
 
-export function AgentHeader({ agent, heartbeat, onBack, onDelete, onAdvanced, onHeartbeat }: AgentHeaderProps) {
+export function AgentHeader({ agent, heartbeat, onBack, onDelete, onAdvanced, onHeartbeat, onSystemPrompt }: AgentHeaderProps) {
   const { t } = useTranslation("agents");
+  const [v3Open, setV3Open] = useState(false);
 
-  const otherCfg = (agent.other_config ?? {}) as Record<string, unknown>;
-  const emoji = typeof otherCfg.emoji === "string" ? otherCfg.emoji : "";
-  const selfEvolve = Boolean(otherCfg.self_evolve);
+  const emoji = agent.emoji ?? "";
+  const selfEvolve = Boolean(agent.self_evolve);
   const title = agentDisplayName(agent, t("card.unnamedAgent"));
   const keyDisplay = agentKeyDisplay(agent.agent_key);
+  const hasOAuthRouting = hasActiveChatGPTOAuthRouting(agent.chatgpt_oauth_routing);
+  const promptMode = readPromptMode(agent);
 
   const hbConfigured = heartbeat != null;
   const hbEnabled = heartbeat?.enabled ?? false;
@@ -51,35 +58,52 @@ export function AgentHeader({ agent, heartbeat, onBack, onDelete, onAdvanced, on
             {agent.is_default && (
               <Star className="h-3.5 w-3.5 shrink-0 fill-amber-400 text-amber-400" />
             )}
-            <Badge
-              variant={
-                agent.status === "active"
-                  ? "success"
-                  : agent.status === "summon_failed"
-                    ? "destructive"
-                    : "secondary"
-              }
-              className="text-[10px]"
-            >
-              {agent.status === "summon_failed" ? t("detail.summonFailed") : agent.status}
-            </Badge>
             <Tooltip>
               <TooltipTrigger asChild>
-                <Badge variant="outline" className="text-[10px]">{agent.agent_type}</Badge>
+                <span
+                  className={cn(
+                    "inline-block h-2.5 w-2.5 shrink-0 rounded-full",
+                    agent.status === "active"
+                      ? "bg-emerald-500"
+                      : agent.status === "summon_failed"
+                        ? "bg-destructive"
+                        : "bg-muted-foreground/50",
+                  )}
+                />
               </TooltipTrigger>
-              <TooltipContent side="bottom" className="max-w-[260px] text-xs">
-                {agent.agent_type === "predefined" ? t("card.predefinedTooltip") : t("card.openTooltip")}
+              <TooltipContent side="bottom" className="text-xs">
+                {agent.status === "summon_failed" ? t("detail.summonFailed") : agent.status}
               </TooltipContent>
             </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Badge
+                  variant="outline"
+                  className={cn("text-2xs", promptModeBadgeClass(promptMode))}
+                >
+                  {t(`detail.prompt.mode.${promptMode}`)}
+                </Badge>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-[260px] text-xs">
+                {t(`detail.prompt.mode.${promptMode}Desc`)}
+              </TooltipContent>
+            </Tooltip>
+            <Badge
+              variant="outline"
+              className="text-2xs bg-blue-50 text-blue-700 hover:bg-blue-100 dark:bg-blue-900/30 dark:text-blue-300 cursor-pointer"
+              onClick={() => setV3Open(true)}
+            >
+              V3
+            </Badge>
             {agent.agent_type === "predefined" && (
               <Tooltip>
                 <TooltipTrigger asChild>
                   <Badge
                     variant={selfEvolve ? "default" : "outline"}
-                    className={`text-[10px] ${selfEvolve ? "bg-violet-100 text-violet-700 hover:bg-violet-100 dark:bg-violet-900/30 dark:text-violet-300" : "text-muted-foreground"}`}
+                    className={`text-2xs ${selfEvolve ? "bg-orange-100 text-orange-700 hover:bg-orange-100 dark:bg-orange-900/30 dark:text-orange-300" : "text-muted-foreground"}`}
                   >
-                    <Sparkles className="mr-0.5 h-2.5 w-2.5" />
-                    {selfEvolve ? t("detail.evolving") : t("detail.static")}
+                    <Sparkles className="h-2.5 w-2.5 sm:mr-0.5" />
+                    <span className="hidden sm:inline">{selfEvolve ? t("detail.evolving") : t("detail.static")}</span>
                   </Badge>
                 </TooltipTrigger>
                 <TooltipContent side="bottom" className="max-w-[240px] text-xs">
@@ -87,9 +111,21 @@ export function AgentHeader({ agent, heartbeat, onBack, onDelete, onAdvanced, on
                 </TooltipContent>
               </Tooltip>
             )}
+            {hasOAuthRouting && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Badge variant="outline" className="text-2xs">
+                    {t("chatgptOAuthRouting.badge")}
+                  </Badge>
+                </TooltipTrigger>
+                <TooltipContent side="bottom" className="max-w-[240px] text-xs">
+                  {t("chatgptOAuthRouting.badgeTooltip")}
+                </TooltipContent>
+              </Tooltip>
+            )}
           </div>
           <div className="flex items-center gap-1.5 text-xs text-muted-foreground mt-0.5">
-            <span className="font-mono text-[11px]">{keyDisplay}</span>
+            <span className="font-mono text-xs-plus">{keyDisplay}</span>
             {agent.provider && (
               <>
                 <span className="text-border">·</span>
@@ -99,6 +135,11 @@ export function AgentHeader({ agent, heartbeat, onBack, onDelete, onAdvanced, on
           </div>
         </div>
 
+        {/* System prompt preview */}
+        <Button variant="ghost" size="sm" onClick={onSystemPrompt} className="shrink-0 gap-1.5">
+          <Eye className="h-4 w-4" />
+          <span className="hidden sm:inline">{t("files.systemPromptPreview")}</span>
+        </Button>
         {/* Heartbeat action */}
         <Button variant="ghost" size="sm" onClick={onHeartbeat} className="shrink-0 gap-1.5 size-9 sm:w-auto sm:px-3">
           <Heart className={`h-4 w-4 ${hbEnabled ? "fill-rose-500 text-rose-500 animate-pulse" : hbConfigured ? "text-rose-400" : "text-muted-foreground"}`} />
@@ -112,20 +153,33 @@ export function AgentHeader({ agent, heartbeat, onBack, onDelete, onAdvanced, on
                   : t("heartbeat.on")}
           </span>
         </Button>
-        <Button variant="ghost" size="sm" onClick={onAdvanced} className="shrink-0 gap-1.5 size-9 sm:w-auto sm:px-3">
-          <Settings className="h-4 w-4" />
-          <span className="hidden sm:inline">{t("detail.advanced")}</span>
-        </Button>
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={onDelete}
-          className="shrink-0 gap-1.5 size-9 sm:w-auto sm:px-3 text-muted-foreground hover:text-destructive"
-        >
-          <Trash2 className="h-4 w-4" />
-          <span className="hidden sm:inline">{t("delete.title")}</span>
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button variant="ghost" size="icon" onClick={onAdvanced} className="shrink-0 size-9">
+              <Settings className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="text-xs">
+            {t("detail.advanced")}
+          </TooltipContent>
+        </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={onDelete}
+              className="shrink-0 size-9 text-destructive hover:text-destructive hover:bg-destructive/10"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="text-xs">
+            {t("delete.title")}
+          </TooltipContent>
+        </Tooltip>
       </div>
+      <V3CapabilitiesModal open={v3Open} onOpenChange={setV3Open} />
     </TooltipProvider>
   );
 }

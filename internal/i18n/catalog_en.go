@@ -10,7 +10,7 @@ func init() {
 		MsgInvalidRequest:   "invalid request: %s",
 		MsgInvalidJSON:      "invalid JSON",
 		MsgUnauthorized:     "unauthorized",
-		MsgPermissionDenied: "permission denied: insufficient role for %s",
+		MsgPermissionDenied: "permission denied: %s",
 		MsgInternalError:    "internal error: %s",
 		MsgInvalidSlug:      "%s must be a valid slug (lowercase letters, numbers, hyphens only)",
 		MsgFailedToList:     "failed to list %s",
@@ -30,6 +30,14 @@ func init() {
 		MsgNoUserMessage:     "no user message found",
 		MsgUserIDRequired:    "user_id is required",
 		MsgMsgRequired:       "message is required",
+
+		// Abort
+		MsgAbortStopped:         "run stopped",
+		MsgAbortForced:          "run force-aborted (3s grace exceeded)",
+		MsgAbortAlreadyAborting: "abort already in progress",
+		MsgAbortNotFound:        "run not found or already finished",
+		MsgAbortUnauthorized:    "not authorized to abort this run",
+		MsgAbortFailed:          "failed to abort run: %s",
 
 		// Channel instances
 		MsgInvalidChannelType: "invalid channel_type",
@@ -65,7 +73,12 @@ func init() {
 		MsgAlreadySummoning:      "agent is already being summoned",
 		MsgSummoningUnavailable:  "summoning not available",
 		MsgNoDescription:         "agent has no description to resummon from",
+		MsgSummonCancelled:       "summon cancelled by user",
+		MsgCannotCancel:          "agent is not being summoned",
 		MsgInvalidPath:           "invalid path",
+
+		// Tenant backup / restore
+		MsgRestoreNewModeRejectsTenantID: "mode=new creates a fresh tenant; pass tenant_slug (not tenant_id) as the new tenant's target slug",
 
 		// Scheduler
 		MsgQueueFull:    "session queue is full",
@@ -81,23 +94,21 @@ func init() {
 		MsgNotImplemented: "%s not yet implemented",
 
 		// Agent links
-		MsgLinksNotConfigured:   "agent links not configured",
-		MsgInvalidDirection:     "direction must be outbound, inbound, or bidirectional",
-		MsgSourceTargetSame:     "source and target must be different agents",
-		MsgCannotDelegateOpen:   "cannot delegate to open agents — only predefined agents can be delegation targets",
-		MsgNoUpdatesProvided:    "no updates provided",
-		MsgInvalidLinkStatus:    "status must be active or disabled",
+		MsgLinksNotConfigured: "agent links not configured",
+		MsgInvalidDirection:   "direction must be outbound, inbound, or bidirectional",
+		MsgSourceTargetSame:   "source and target must be different agents",
+		MsgCannotDelegateOpen: "cannot delegate to open agents — only predefined agents can be delegation targets",
+		MsgNoUpdatesProvided:  "no updates provided",
+		MsgInvalidLinkStatus:  "status must be active or disabled",
 
 		// Teams
 		MsgTeamsNotConfigured:   "teams not configured",
 		MsgAgentIsTeamLead:      "agent is already the team lead",
 		MsgCannotRemoveTeamLead: "cannot remove the team lead",
 
-		// Delegations
-		MsgDelegationsUnavailable: "delegations not available",
-
 		// Channels
 		MsgCannotDeleteDefaultInst: "cannot delete default channel instance",
+		MsgCannotRemoveLastWriter:  "cannot remove the last file writer",
 
 		// Skills
 		MsgSkillsUpdateNotSupported: "skills.update not supported for file-based skills",
@@ -107,8 +118,10 @@ func init() {
 		MsgInvalidLogAction: "action must be 'start' or 'stop'",
 
 		// Config
-		MsgRawConfigRequired: "raw config is required",
-		MsgRawPatchRequired:  "raw patch is required",
+		MsgRawConfigRequired:     "raw config is required",
+		MsgRawPatchRequired:      "raw patch is required",
+		MsgConfigMasterScopeOnly: "config.* methods are master-scope only; use tenant tool config endpoints for per-tenant overrides",
+		MsgMasterScopeRequired:   "this action requires master tenant scope",
 
 		// Storage / File
 		MsgCannotDeleteSkillsDir: "cannot delete skills directories",
@@ -172,10 +185,46 @@ func init() {
 		MsgToolSkillManage:     "Create, patch, or delete skills from conversation experience",
 		MsgToolPublishSkill:    "Register a skill directory in the system database, making it discoverable",
 		MsgToolTeamTasks:       "View, create, update, and complete tasks on the team task board",
-		MsgToolTeamMessage:     "Send a direct message or broadcast to teammates in the agent team",
 
 		MsgSkillNudgePostscript: "This task involved several steps. Want me to save the process as a reusable skill? Reply **\"save as skill\"** or **\"skip\"**.",
 		MsgSkillNudge70Pct:      "[System] You are at 70% of your iteration budget. Consider whether any patterns from this session would make a good skill.",
 		MsgSkillNudge90Pct:      "[System] You are at 90% of your iteration budget. If this session involved reusable patterns, consider saving them as a skill before completing.",
+
+		MsgInvalidRole: "invalid role: allowed values are owner, admin, operator, member, viewer",
+
+		MsgContactIDsRequired:  "contact_ids is required",
+		MsgMergeTargetRequired: "exactly one of tenant_user_id or create_user is required",
+		MsgTenantUserNotFound:  "tenant user not found",
+		MsgTenantMismatch:      "tenant user does not belong to this tenant",
+		MsgTenantScopeRequired: "tenant scope is required for this operation",
+
+		// TTS / Voices
+		MsgTtsUnknownModel:       "unknown tts model: %s",
+		MsgVoicesListFailed:      "failed to list voices: %s",
+		MsgTtsGeminiInvalidVoice: "invalid Gemini voice: %s",
+		MsgTtsGeminiSpeakerLimit: "Gemini TTS supports at most 2 speakers",
+		MsgTtsGeminiInvalidModel:  "invalid Gemini TTS model: %s",
+		MsgTtsGeminiTextOnly:      "Gemini refused to generate audio. Try simpler text without translation or commentary.",
+		MsgTtsParamOutOfRange:     "TTS param %q value %v is out of range [%v, %v]",
+		MsgTtsParamUnknownKey:     "TTS param %q is not supported by this provider",
+		MsgTtsMiniMaxVoicesFailed: "failed to fetch MiniMax voices: %s",
+
+		// STT
+		MsgSTTAllProvidersFailed:     "All STT providers failed",
+		MsgSTTLegacyConfigDeprecated: "Legacy STT config deprecated; migrate to builtin_tools[stt]",
+		MsgSTTWhatsappPrivacyWarning: "Enabling STT for WhatsApp breaks end-to-end encryption for voice messages sent to this agent.",
+		MsgVoiceMessageFallback:      "[Voice message]",
+
+		// Hooks
+		MsgHookInvalidMatcher:          "invalid matcher regex: %s",
+		MsgHookCommandDisabledStandard: "command-type hooks are only available on Lite edition",
+		MsgHookPromptRequiresMatcher:   "prompt hooks require a matcher or if_expr (runaway-cost guard)",
+		MsgHookCircuitBreakerTripped:   "hook auto-disabled after repeated failures",
+		MsgHookBudgetExceeded:          "tenant hook token budget exceeded",
+		MsgHookPerTurnCapReached:       "hook invocation per-turn cap reached",
+		MsgHookBuiltinReadOnly:         "builtin hooks are read-only except for the enabled toggle",
+
+		// Message tool cross-target forward notice
+		MessageCrossTargetForwarded: "📤 Forwarded to %s as requested: %q",
 	})
 }

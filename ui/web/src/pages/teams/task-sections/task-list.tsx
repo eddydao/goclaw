@@ -1,16 +1,20 @@
-import { useState, useMemo, useCallback, useEffect } from "react";
-import { ClipboardList, Trash2 } from "lucide-react";
+import { useState, useMemo, useCallback, useEffect, lazy, Suspense } from "react";
+import { ClipboardList, Trash2, MessageSquare, Paperclip } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { useTranslation } from "react-i18next";
+import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { ConfirmDeleteDialog } from "@/components/shared/confirm-delete-dialog";
 import { Pagination } from "@/components/shared/pagination";
 import { usePagination } from "@/hooks/use-pagination";
 import type { TeamTaskData, TeamTaskComment, TeamTaskEvent, TeamTaskAttachment } from "@/types/team";
 import type { TeamMemberData } from "@/types/team";
 import { taskStatusBadgeVariant, isTerminalStatus } from "./task-utils";
-import { TaskDetailDialog } from "./task-detail-dialog";
 import { buildTaskLookup, buildMemberLookup } from "../board/board-utils";
+
+const TaskDetailDialog = lazy(() =>
+  import("./task-detail-dialog").then((m) => ({ default: m.TaskDetailDialog }))
+);
 
 interface TaskListProps {
   tasks: TeamTaskData[];
@@ -25,17 +29,20 @@ interface TaskListProps {
   }>;
   deleteTask?: (teamId: string, taskId: string) => Promise<void>;
   deleteTasksBulk?: (teamId: string, taskIds: string[]) => Promise<number>;
+  addTaskComment?: (teamId: string, taskId: string, content: string) => Promise<void>;
 }
 
 export function TaskList({
   tasks, loading, teamId, members, isTeamV2, emojiLookup,
-  getTaskDetail, deleteTask, deleteTasksBulk,
+  getTaskDetail, deleteTask, deleteTasksBulk, addTaskComment,
 }: TaskListProps) {
   const { t } = useTranslation("teams");
   const [selectedTask, setSelectedTask] = useState<TeamTaskData | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
+  const [deleteTargetId, setDeleteTargetId] = useState<string | null>(null);
+  const [singleDeleting, setSingleDeleting] = useState(false);
   const taskLookup = useMemo(() => buildTaskLookup(tasks), [tasks]);
   const memberLookup = useMemo(() => buildMemberLookup(members), [members]);
   const { pageItems, pagination, setPage, setPageSize } = usePagination(tasks, { defaultPageSize: 20 });
@@ -90,6 +97,17 @@ export function TaskList({
     }
   }, [deleteTasksBulk, teamId, selectedIds]);
 
+  const handleSingleDelete = useCallback(async () => {
+    if (!deleteTask || !deleteTargetId) return;
+    setSingleDeleting(true);
+    try {
+      await deleteTask(teamId, deleteTargetId);
+      setDeleteTargetId(null);
+    } finally {
+      setSingleDeleting(false);
+    }
+  }, [deleteTask, teamId, deleteTargetId]);
+
   if (loading && tasks.length === 0) {
     return <div className="py-8 text-center text-sm text-muted-foreground">{t("tasks.loading")}</div>;
   }
@@ -107,8 +125,7 @@ export function TaskList({
   const handleDelete = (e: React.MouseEvent, taskId: string) => {
     e.stopPropagation();
     if (!deleteTask) return;
-    if (!window.confirm(t("tasks.deleteConfirm"))) return;
-    deleteTask(teamId, taskId);
+    setDeleteTargetId(taskId);
   };
 
   const hasBulkDelete = !!deleteTasksBulk && pageTerminalIds.length > 0;
@@ -189,21 +206,35 @@ export function TaskList({
                   <p className="truncate text-xs text-muted-foreground/70">{task.description}</p>
                 )}
                 {task.task_type && task.task_type !== "general" && (
-                  <Badge variant="outline" className="mt-0.5 text-[10px]">{task.task_type}</Badge>
+                  <Badge variant="outline" className="mt-0.5 text-2xs">{task.task_type}</Badge>
+                )}
+                {((task.comment_count ?? 0) > 0 || (task.attachment_count ?? 0) > 0) && (
+                  <div className="mt-0.5 flex items-center gap-2 text-2xs text-muted-foreground">
+                    {(task.comment_count ?? 0) > 0 && (
+                      <span className="flex items-center gap-0.5">
+                        <MessageSquare className="h-3 w-3" /> {task.comment_count}
+                      </span>
+                    )}
+                    {(task.attachment_count ?? 0) > 0 && (
+                      <span className="flex items-center gap-0.5">
+                        <Paperclip className="h-3 w-3" /> {task.attachment_count}
+                      </span>
+                    )}
+                  </div>
                 )}
                 {isTeamV2 && task.progress_percent != null && task.progress_percent > 0 && !isTerminal && (
                   <div className="mt-1 flex items-center gap-1.5">
                     <div className="h-1.5 flex-1 rounded-full bg-muted">
                       <div className="h-full rounded-full bg-primary transition-all" style={{ width: `${task.progress_percent}%` }} />
                     </div>
-                    <span className="text-[10px] text-muted-foreground">{task.progress_percent}%</span>
+                    <span className="text-2xs text-muted-foreground">{task.progress_percent}%</span>
                   </div>
                 )}
               </div>
               <div className="flex flex-wrap items-center gap-1">
                 <Badge variant={taskStatusBadgeVariant(task.status)}>{task.status.replace(/_/g, " ")}</Badge>
                 {isTeamV2 && task.followup_at && task.status === "in_progress" && (
-                  <Badge variant="outline" className="border-amber-500/50 bg-amber-500/10 text-[10px] text-amber-700 dark:text-amber-400">
+                  <Badge variant="outline" className="border-amber-500/50 bg-amber-500/10 text-2xs text-amber-700 dark:text-amber-400">
                     {t("tasks.badges.awaitingReply")}
                   </Badge>
                 )}
@@ -238,22 +269,36 @@ export function TaskList({
       />
 
       {selectedTask && (
-        <TaskDetailDialog
-          task={selectedTask}
-          teamId={teamId}
-          isTeamV2={isTeamV2}
-          onClose={() => setSelectedTask(null)}
-          getTaskDetail={getTaskDetail}
-          deleteTask={deleteTask}
-          taskLookup={taskLookup}
-          memberLookup={memberLookup}
-          emojiLookup={emojiLookup}
-          onNavigateTask={(taskId) => {
-            const found = tasks.find((t) => t.id === taskId);
-            if (found) setSelectedTask(found);
-          }}
-        />
+        <Suspense fallback={null}>
+          <TaskDetailDialog
+            task={selectedTask}
+            teamId={teamId}
+            isTeamV2={isTeamV2}
+            onClose={() => setSelectedTask(null)}
+            getTaskDetail={getTaskDetail}
+            deleteTask={deleteTask}
+            onAddComment={addTaskComment}
+            taskLookup={taskLookup}
+            memberLookup={memberLookup}
+            emojiLookup={emojiLookup}
+            onNavigateTask={(taskId) => {
+              const found = tasks.find((t) => t.id === taskId);
+              if (found) setSelectedTask(found);
+            }}
+          />
+        </Suspense>
       )}
+
+      <ConfirmDialog
+        open={!!deleteTargetId}
+        onOpenChange={(v) => !v && setDeleteTargetId(null)}
+        title={t("tasks.delete")}
+        description={t("tasks.deleteConfirm")}
+        confirmLabel={t("tasks.delete")}
+        variant="destructive"
+        onConfirm={handleSingleDelete}
+        loading={singleDeleting}
+      />
 
       <ConfirmDeleteDialog
         open={confirmOpen}
