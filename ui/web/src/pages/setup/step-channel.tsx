@@ -96,16 +96,11 @@ export function StepChannel({ agent, onComplete, onSkip, onBack }: StepChannelPr
     <Card className="py-0 gap-0">
       <CardContent className="space-y-4 px-6 py-5">
         <TooltipProvider>
-        <div className="flex items-start justify-between gap-4">
-          <div className="space-y-1">
-            <h2 className="text-lg font-semibold">{t("channel.title")}</h2>
-            <p className="text-sm text-muted-foreground">
-              {t("channel.description")}
-            </p>
-          </div>
-          <Button variant="outline" size="sm" onClick={onSkip}>
-            {t("channel.skip")}
-          </Button>
+        <div className="space-y-1">
+          <h2 className="text-lg font-semibold">{t("channel.title")}</h2>
+          <p className="text-sm text-muted-foreground">
+            {t("channel.description")}
+          </p>
         </div>
 
         {/* Agent badge */}
